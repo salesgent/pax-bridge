@@ -41,6 +41,10 @@ fn error_map(code: &str) -> (StatusCode, &'static str) {
             StatusCode::GATEWAY_TIMEOUT,
             "No response within the timeout. IMPORTANT: the card may already have been charged — verify on the terminal before retrying. Do NOT blindly retry.",
         ),
+        "CANCELED" => (
+            StatusCode::CONFLICT,
+            "The terminal keeps its card prompt until it times out or its red Cancel key is pressed. If a card is charged anyway, this bridge voids it automatically.",
+        ),
         "LRC_MISMATCH" => (
             StatusCode::BAD_GATEWAY,
             "Corrupted response (LRC check failed). This can indicate a protocol version mismatch or a noisy connection.",
@@ -237,6 +241,19 @@ async fn ping_terminal(State(state): State<AppState>, Path(id): Path<String>) ->
         Some(t) => t,
         None => return not_found("Terminal not found"),
     };
+    // Without this a ping would queue behind the live command and report a
+    // timeout, which reads as "terminal unreachable" instead of "still busy".
+    if transport::is_busy(&terminal) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "online": true, "error": {
+                "code": "TERMINAL_BUSY",
+                "message": "Terminal is busy",
+                "hint": "Finish the transaction on the terminal, or clear its card prompt with the red Cancel key, then try again."
+            }})),
+        );
+    }
+
     match transport::initialize(&terminal, None).await {
         Ok(info) => (StatusCode::OK, Json(json!({ "online": true, "info": info }))),
         Err(err) => {
@@ -246,6 +263,34 @@ async fn ping_terminal(State(state): State<AppState>, Path(id): Path<String>) ->
             }
             (status, Json(body))
         }
+    }
+}
+
+/// Abort whatever is in flight on this terminal, without needing a txnId.
+///
+/// The POS learns a payment's txnId from the WebSocket, which can be blocked
+/// (e.g. Chrome Local Network Access) even when HTTP works. Without this route
+/// a cashier's Cancel would then be local-only: the sale would stay live on the
+/// wire and the terminal would keep prompting for a card.
+async fn cancel_terminal(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    let terminal = { state.db.lock().await.get_terminal(&id) };
+    let terminal = match terminal {
+        Some(t) => t,
+        None => return not_found("Terminal not found"),
+    };
+
+    if transport::cancel(&terminal) {
+        tracing::warn!("[payment] cancel requested for terminal \"{}\" (no txnId)", terminal.name);
+        (StatusCode::OK, Json(json!({ "canceled": true, "terminalId": id })))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": {
+                "code": "NOT_IN_FLIGHT",
+                "message": "No command is currently in flight for this terminal.",
+                "hint": "The payment may have just completed — check its status before retrying."
+            }})),
+        )
     }
 }
 
@@ -307,7 +352,168 @@ async fn batch_close_terminal(State(state): State<AppState>, Path(id): Path<Stri
 // ---------------------------------------------------------------------------
 
 type InvokeFuture = Pin<Box<dyn Future<Output = Result<CreditResponse, PaxError>> + Send>>;
-type Invoke = Box<dyn FnOnce(String, Option<OnState>) -> InvokeFuture + Send>;
+type Invoke = Box<dyn FnOnce(String, Option<OnState>, Option<transport::LateCredit>) -> InvokeFuture + Send>;
+
+/// Record a result the terminal produced after the POS gave up waiting.
+///
+/// Cancelling stops the POS from waiting; it cannot stop a customer who taps
+/// their card anyway. A sale that lands here is money taken for an order the
+/// POS already abandoned, so it is voided immediately rather than left for
+/// someone to notice on a statement.
+async fn record_late_result(
+    state: AppState,
+    terminal: Terminal,
+    txn_id: String,
+    ecr_ref_num: String,
+    tx_type: &'static str,
+    result: Result<CreditResponse, PaxError>,
+) {
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            // The terminal never completed it either — the cancel stands.
+            let mut patch = Map::new();
+            patch.insert("status".into(), json!("CANCELED"));
+            patch.insert("unknown".into(), json!(false));
+            patch.insert("error".into(), json!({ "code": err.code, "message": err.message }));
+            state.db.lock().await.update_transaction(&txn_id, patch);
+
+            tracing::info!(
+                "[payment] {} CANCELED settled — txnId={} ecrRefNum={} terminal=\"{}\" — terminal ended with {}: {} — no card was charged.",
+                tx_type,
+                txn_id,
+                ecr_ref_num,
+                terminal.name,
+                err.code,
+                err.message,
+            );
+            state.ws.emit(json!({ "type": "CANCELED", "txnId": txn_id, "ecrRefNum": ecr_ref_num }));
+            return;
+        }
+    };
+
+    let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
+    let mut patch = Map::new();
+    patch.insert("response".into(), result_value.clone());
+    patch.insert("resultCode".into(), json!(result.result_code.clone()));
+    patch.insert("resultTxt".into(), json!(result.result_txt.clone()));
+    patch.insert("authCode".into(), json!(result.auth_code.clone()));
+    patch.insert("refNum".into(), json!(result.ref_num.clone()));
+    patch.insert("transactionNum".into(), json!(result.transaction_num.clone()));
+    patch.insert("last4".into(), json!(result.last4.clone()));
+    patch.insert("cardType".into(), json!(result.card_type.clone()));
+    patch.insert("approvedAmountCents".into(), json!(result.approved_amount_cents));
+    patch.insert("canceledByPos".into(), json!(true));
+
+    if !result.approved {
+        // Declined, or aborted on the device — nothing was charged.
+        patch.insert("status".into(), json!("CANCELED"));
+        patch.insert("unknown".into(), json!(false));
+        state.db.lock().await.update_transaction(&txn_id, patch);
+
+        tracing::info!(
+            "[payment] {} CANCELED settled — txnId={} ecrRefNum={} terminal=\"{}\" resultCode={} resultTxt=\"{}\" — no card was charged.",
+            tx_type,
+            txn_id,
+            ecr_ref_num,
+            terminal.name,
+            non_empty(&result.result_code),
+            result.result_txt,
+        );
+        state.ws.emit(json!({ "type": "CANCELED", "txnId": txn_id, "ecrRefNum": ecr_ref_num, "result": result_value }));
+        return;
+    }
+
+    // Approved after the POS walked away. Flag it as unknown until the void
+    // settles it, so a crash here still leaves a record that needs attention.
+    patch.insert("status".into(), json!("APPROVED"));
+    patch.insert("unknown".into(), json!(true));
+    state.db.lock().await.update_transaction(&txn_id, patch);
+    state.ws.emit(json!({ "type": "APPROVED", "txnId": txn_id.clone(), "ecrRefNum": ecr_ref_num.clone(), "result": result_value }));
+
+    if tx_type != "SALE" {
+        // Auto-reversing a refund or a void is not something to decide here.
+        tracing::error!(
+            "[payment] {} APPROVED after cancel — txnId={} ecrRefNum={} terminal=\"{}\" amount={} — completed on the terminal after the POS cancelled; reverse it manually.",
+            tx_type,
+            txn_id,
+            ecr_ref_num,
+            terminal.name,
+            fmt_money(result.approved_amount_cents),
+        );
+        return;
+    }
+
+    tracing::error!(
+        "[payment] SALE APPROVED after cancel — txnId={} ecrRefNum={} terminal=\"{}\" amount={} authCode={} last4={} — voiding it now.",
+        txn_id,
+        ecr_ref_num,
+        terminal.name,
+        fmt_money(result.approved_amount_cents),
+        non_empty(&result.auth_code),
+        non_empty(&result.last4),
+    );
+
+    let void_ecr_ref_num = { state.db.lock().await.next_ecr_ref_num() };
+    let orig_trans_num = if result.transaction_num.is_empty() { None } else { Some(result.transaction_num.clone()) };
+    let voided = transport::void_transaction(
+        &terminal,
+        result.ref_num.clone(),
+        void_ecr_ref_num.clone(),
+        result.approved_amount_cents,
+        orig_trans_num,
+        None,
+        None,
+    )
+    .await;
+
+    let mut patch = Map::new();
+    match voided {
+        Ok(void_result) if void_result.approved => {
+            patch.insert("status".into(), json!("VOIDED"));
+            patch.insert("unknown".into(), json!(false));
+            patch.insert("voidedByEcrRefNum".into(), json!(void_ecr_ref_num));
+            state.db.lock().await.update_transaction(&txn_id, patch);
+
+            tracing::warn!(
+                "[payment] SALE VOIDED after cancel — txnId={} ecrRefNum={} terminal=\"{}\" amount={} — the cancelled charge was reversed.",
+                txn_id,
+                ecr_ref_num,
+                terminal.name,
+                fmt_money(result.approved_amount_cents),
+            );
+            state.ws.emit(json!({ "type": "VOIDED", "txnId": txn_id, "ecrRefNum": ecr_ref_num }));
+        }
+        Ok(void_result) => {
+            patch.insert("voidError".into(), json!({ "code": void_result.result_code, "message": void_result.result_txt }));
+            state.db.lock().await.update_transaction(&txn_id, patch);
+
+            tracing::error!(
+                "[payment] SALE void DECLINED after cancel — txnId={} ecrRefNum={} terminal=\"{}\" amount={} — THE CARD IS STILL CHARGED, void or refund it manually.",
+                txn_id,
+                ecr_ref_num,
+                terminal.name,
+                fmt_money(result.approved_amount_cents),
+            );
+            state.ws.emit(json!({ "type": "VOID_FAILED", "txnId": txn_id, "ecrRefNum": ecr_ref_num }));
+        }
+        Err(err) => {
+            patch.insert("voidError".into(), json!({ "code": err.code, "message": err.message }));
+            state.db.lock().await.update_transaction(&txn_id, patch);
+
+            tracing::error!(
+                "[payment] SALE void FAILED after cancel — txnId={} ecrRefNum={} terminal=\"{}\" amount={} code={} message=\"{}\" — THE CARD IS STILL CHARGED, void or refund it manually.",
+                txn_id,
+                ecr_ref_num,
+                terminal.name,
+                fmt_money(result.approved_amount_cents),
+                err.code,
+                err.message,
+            );
+            state.ws.emit(json!({ "type": "VOID_FAILED", "txnId": txn_id, "ecrRefNum": ecr_ref_num }));
+        }
+    }
+}
 
 async fn require_terminal(state: &AppState, body: &Value) -> Result<Terminal, (StatusCode, Json<Value>)> {
     let terminal_id = body.get("terminalId").and_then(Value::as_str);
@@ -350,7 +556,7 @@ async fn run_payment(
     if transport::is_busy(terminal) {
         return (
             StatusCode::CONFLICT,
-            json!({ "error": { "code": "TERMINAL_BUSY", "message": "Terminal is busy", "hint": "Wait for the current transaction to finish before starting another." } }),
+            json!({ "error": { "code": "TERMINAL_BUSY", "message": "Terminal is busy", "hint": "Finish the transaction on the terminal, or clear its card prompt with the red Cancel key, then try again." } }),
             Map::new(),
         );
     }
@@ -405,7 +611,15 @@ async fn run_payment(
         ws_for_state.emit(json!({ "type": evt, "txnId": state_txn_id.clone(), "ecrRefNum": state_ecr.clone() }));
     });
 
-    match invoke(ecr_ref_num.clone(), Some(on_state)).await {
+    let late_state = state.clone();
+    let late_terminal = terminal.clone();
+    let late_txn_id = txn_id.clone();
+    let late_ecr_ref_num = ecr_ref_num.clone();
+    let on_late: transport::LateCredit = Box::new(move |result| {
+        tokio::spawn(record_late_result(late_state, late_terminal, late_txn_id, late_ecr_ref_num, tx_type, result));
+    });
+
+    match invoke(ecr_ref_num.clone(), Some(on_state), Some(on_late)).await {
         Ok(result) => {
             let status_str = if result.approved { "APPROVED" } else { "DECLINED" };
             let result_value = serde_json::to_value(&result).unwrap_or(Value::Null);
@@ -451,12 +665,11 @@ async fn run_payment(
         }
         Err(err) => {
             if err.code == "CANCELED" {
-                // The connection was dropped mid-prompt, so the terminal never
-                // reported back. Almost always this means no card was charged,
-                // but a race (card approved microseconds before the cancel
-                // landed) can't be ruled out from here — flag it as unknown so
-                // the POS tells the cashier to verify rather than silently
-                // assuming nothing happened.
+                // The POS stopped waiting, but the command is still on the wire
+                // because the terminal keeps prompting regardless. Whatever it
+                // finally reports goes to `record_late_result`, which settles
+                // this record and voids a charge nobody asked for — until then
+                // the outcome is genuinely unknown.
                 let mut patch = Map::new();
                 patch.insert("status".into(), json!("CANCELED"));
                 patch.insert("unknown".into(), json!(true));
@@ -468,7 +681,7 @@ async fn run_payment(
                 .unwrap_or_else(|| txn.clone());
 
                 tracing::warn!(
-                    "[payment] {} CANCELED — txnId={} ecrRefNum={} terminal=\"{}\" amount={} — cancelled from the POS; confirm the terminal returned to idle and no receipt printed.",
+                    "[payment] {} CANCELED — txnId={} ecrRefNum={} terminal=\"{}\" amount={} — POS stopped waiting; still watching the terminal, a charge that lands now is voided automatically.",
                     tx_type,
                     txn_id,
                     ecr_ref_num,
@@ -550,7 +763,9 @@ async fn sale_payment(State(state): State<AppState>, Json(body): Json<Value>) ->
     let order_ref = body.get("orderRef").and_then(Value::as_str).map(|s| s.to_string());
 
     let terminal_for_invoke = terminal.clone();
-    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state| Box::pin(async move { transport::sale(&terminal_for_invoke, amount_cents, ecr_ref_num, tip_cents, on_state).await }));
+    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state, on_late| {
+        Box::pin(async move { transport::sale(&terminal_for_invoke, amount_cents, ecr_ref_num, tip_cents, on_state, on_late).await })
+    });
 
     let (status, resp_body, _updated) = run_payment(&state, &terminal, "SALE", amount_cents, tip_cents, order_ref, Map::new(), invoke).await;
     (status, Json(resp_body))
@@ -568,7 +783,9 @@ async fn refund_payment(State(state): State<AppState>, Json(body): Json<Value>) 
     let order_ref = body.get("orderRef").and_then(Value::as_str).map(|s| s.to_string());
 
     let terminal_for_invoke = terminal.clone();
-    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state| Box::pin(async move { transport::refund(&terminal_for_invoke, amount_cents, ecr_ref_num, on_state).await }));
+    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state, on_late| {
+        Box::pin(async move { transport::refund(&terminal_for_invoke, amount_cents, ecr_ref_num, on_state, on_late).await })
+    });
 
     let (status, resp_body, _updated) = run_payment(&state, &terminal, "RETURN", amount_cents, 0, order_ref, Map::new(), invoke).await;
     (status, Json(resp_body))
@@ -617,8 +834,19 @@ async fn void_payment(State(state): State<AppState>, Json(body): Json<Value>) ->
     let terminal_for_invoke = terminal.clone();
     let orig_ref_for_invoke = orig_ref_num.clone();
     let orig_trans_for_invoke = orig_transaction_num.clone();
-    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state| {
-        Box::pin(async move { transport::void_transaction(&terminal_for_invoke, orig_ref_for_invoke, ecr_ref_num, orig_amount_cents, orig_trans_for_invoke, on_state).await })
+    let invoke: Invoke = Box::new(move |ecr_ref_num, on_state, on_late| {
+        Box::pin(async move {
+            transport::void_transaction(
+                &terminal_for_invoke,
+                orig_ref_for_invoke,
+                ecr_ref_num,
+                orig_amount_cents,
+                orig_trans_for_invoke,
+                on_state,
+                on_late,
+            )
+            .await
+        })
     });
 
     let (status, resp_body, updated) = run_payment(&state, &terminal, "VOID", orig_amount_cents, 0, orig_order_ref, extra, invoke).await;
@@ -740,6 +968,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(list_terminals).post(create_terminal))
         .route("/{id}", put(update_terminal_handler).delete(delete_terminal_handler))
         .route("/{id}/ping", post(ping_terminal))
+        .route("/{id}/cancel", post(cancel_terminal))
         .route("/{id}/diagnose", post(diagnose_terminal))
         .route("/{id}/batch-close", post(batch_close_terminal));
 

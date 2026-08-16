@@ -45,9 +45,16 @@ impl Target {
 }
 
 struct TerminalQueue {
-    lock: tokio::sync::Mutex<()>,
+    lock: Arc<tokio::sync::Mutex<()>>,
     pending: AtomicUsize,
 }
+
+/// Handles a raw response that arrived after the caller stopped waiting.
+type LateRaw = Box<dyn FnOnce(Result<protocol::ParsedResponse, PaxError>) + Send + 'static>;
+
+/// Handles a credit result that arrived after the POS cancelled the wait —
+/// i.e. the customer completed the payment on the terminal anyway.
+pub type LateCredit = Box<dyn FnOnce(Result<CreditResponse, PaxError>) + Send + 'static>;
 
 static QUEUES: OnceLock<StdMutex<HashMap<String, Arc<TerminalQueue>>>> = OnceLock::new();
 
@@ -59,12 +66,13 @@ fn cancels() -> &'static StdMutex<HashMap<String, CancellationToken>> {
     CANCELS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// Abort the in-flight command for this terminal, if any.
+/// Stop waiting on the in-flight command for this terminal, if any.
 ///
-/// This drops the ECR connection mid-transaction, which is what releases the
-/// terminal from the prompt. It is NOT a protocol-level "void": if the card was
-/// already authorized in the split second before cancelling, the cancel does not
-/// reverse it — callers must treat the outcome as unknown and verify.
+/// The terminal keeps its own card prompt until it times out or the red Cancel
+/// key is pressed, so this does NOT stop the customer from paying. The command
+/// therefore keeps running on its socket: whatever the terminal finally reports
+/// is handed to the `on_late` hook the caller passed to sale/refund/void, which
+/// is what lets an unwanted approval be voided instead of silently charged.
 /// Returns false if nothing was in flight.
 pub fn cancel(terminal: &Terminal) -> bool {
     let key = Target::from_terminal(terminal).key();
@@ -95,7 +103,7 @@ fn queue_for(key: &str) -> Arc<TerminalQueue> {
     let mut guard = queues().lock().unwrap();
     guard
         .entry(key.to_string())
-        .or_insert_with(|| Arc::new(TerminalQueue { lock: tokio::sync::Mutex::new(()), pending: AtomicUsize::new(0) }))
+        .or_insert_with(|| Arc::new(TerminalQueue { lock: Arc::new(tokio::sync::Mutex::new(())), pending: AtomicUsize::new(0) }))
         .clone()
 }
 
@@ -115,16 +123,22 @@ impl Drop for PendingGuard {
 
 /// Send a command to a terminal and await its response frame, serialized
 /// per-terminal so only one command is ever in flight on the wire.
-async fn send_command(terminal: &Terminal, fields: Vec<Field>, timeout_ms: u64, on_state: Option<OnState>) -> Result<protocol::ParsedResponse, PaxError> {
+async fn send_command(
+    terminal: &Terminal,
+    fields: Vec<Field>,
+    timeout_ms: u64,
+    on_state: Option<OnState>,
+    on_late: Option<LateRaw>,
+) -> Result<protocol::ParsedResponse, PaxError> {
     let target = Target::from_terminal(terminal);
     let key = target.key();
     let q = queue_for(&key);
 
     q.pending.fetch_add(1, Ordering::SeqCst);
-    let _pending_guard = PendingGuard(q.clone());
+    let pending_guard = PendingGuard(q.clone());
 
     // Serialize: only one in-flight command at a time per terminal.
-    let _lock = q.lock.lock().await;
+    let lock = q.lock.clone().lock_owned().await;
 
     let command = match fields.first() {
         Some(Field::Single(s)) => s.clone(),
@@ -137,24 +151,48 @@ async fn send_command(terminal: &Terminal, fields: Vec<Field>, timeout_ms: u64, 
     // belongs to the command actually on the wire.
     let token = CancellationToken::new();
     cancels().lock().unwrap().insert(key.clone(), token.clone());
-    let _cancel_guard = CancelGuard(key);
+    let cancel_guard = CancelGuard(key);
 
-    let send = async {
-        match target {
+    // The wire work owns the guards so it can outlive a cancel: closing the
+    // socket would not clear the terminal's card prompt, it would only throw
+    // away the result of a card the customer may still tap. The terminal stays
+    // marked busy for as long as the command is genuinely on the wire.
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // Dropped in reverse order: the cancel token is deregistered before the
+        // queue lock is released, so the next command can register its own.
+        let _pending_guard = pending_guard;
+        let _lock = lock;
+        let _cancel_guard = cancel_guard;
+
+        let result = match target {
             Target::Tcp { ip, port } => tcp::send_command(&ip, port, &request, expected.as_deref(), timeout_ms, on_state).await,
             Target::Usb { path, baud_rate } => serial::send_command(&path, baud_rate, request, expected, timeout_ms, on_state).await,
-        }
-    };
+        };
+        let _ = tx.send(result);
+    });
 
-    // Dropping `send` on cancel closes the socket / serial handle, which is what
-    // releases the terminal from its card prompt.
     tokio::select! {
-        result = send => result,
-        _ = token.cancelled() => Err(PaxError::new(
-            "CANCELED",
-            "Cancelled from the point of sale before the terminal responded.",
-        )),
+        received = &mut rx => {
+            return received.unwrap_or_else(|_| Err(PaxError::new("SOCKET_ERROR", "Terminal command ended without a result")));
+        }
+        _ = token.cancelled() => {}
     }
+
+    if let Some(handler) = on_late {
+        // Still racing: a result sent just before the cancel landed is waiting
+        // in the channel and reaches the handler immediately.
+        tokio::spawn(async move {
+            if let Ok(result) = rx.await {
+                handler(result);
+            }
+        });
+    }
+
+    Err(PaxError::new(
+        "CANCELED",
+        "Stopped waiting from the point of sale. The terminal keeps its card prompt until it times out or its red Cancel key is pressed.",
+    ))
 }
 
 /// List serial ports available on the host (for the "detect USB device" UI).
@@ -162,18 +200,32 @@ pub async fn list_serial_ports() -> Result<Vec<SerialPortInfo>, PaxError> {
     serial::list_ports().await
 }
 
+/// Wraps a credit-result handler so it can consume a raw response frame.
+fn late_credit(on_late: Option<LateCredit>) -> Option<LateRaw> {
+    on_late.map(|handler| -> LateRaw {
+        Box::new(move |raw| handler(raw.map(|parsed| protocol::parse_credit_response(&parsed))))
+    })
+}
+
 /// A00 initialize / ping. Returns terminal info + latencyMs.
 pub async fn initialize(terminal: &Terminal, on_state: Option<OnState>) -> Result<InitializeInfo, PaxError> {
     let started = Instant::now();
     let fields = vec![Field::Single(protocol::COMMAND_INITIALIZE.to_string()), Field::Single(config::protocol_version())];
-    let parsed = send_command(terminal, fields, config::ping_timeout_ms(), on_state).await?;
+    let parsed = send_command(terminal, fields, config::ping_timeout_ms(), on_state, None).await?;
     let mut info = protocol::parse_initialize(&parsed);
     info.latency_ms = started.elapsed().as_millis() as i64;
     Ok(info)
 }
 
 /// T00 SALE. amountCents/tipCents are integer cents.
-pub async fn sale(terminal: &Terminal, amount_cents: i64, ecr_ref_num: String, tip_cents: i64, on_state: Option<OnState>) -> Result<CreditResponse, PaxError> {
+pub async fn sale(
+    terminal: &Terminal,
+    amount_cents: i64,
+    ecr_ref_num: String,
+    tip_cents: i64,
+    on_state: Option<OnState>,
+    on_late: Option<LateCredit>,
+) -> Result<CreditResponse, PaxError> {
     let fields = protocol::build_credit_fields(CreditFieldsInput {
         txn_type: protocol::TXN_TYPE_SALE,
         amount_cents,
@@ -183,12 +235,18 @@ pub async fn sale(terminal: &Terminal, amount_cents: i64, ecr_ref_num: String, t
         orig_ref_num: None,
         orig_trans_num: None,
     });
-    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state).await?;
+    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))
 }
 
 /// T00 RETURN / refund.
-pub async fn refund(terminal: &Terminal, amount_cents: i64, ecr_ref_num: String, on_state: Option<OnState>) -> Result<CreditResponse, PaxError> {
+pub async fn refund(
+    terminal: &Terminal,
+    amount_cents: i64,
+    ecr_ref_num: String,
+    on_state: Option<OnState>,
+    on_late: Option<LateCredit>,
+) -> Result<CreditResponse, PaxError> {
     let fields = protocol::build_credit_fields(CreditFieldsInput {
         txn_type: protocol::TXN_TYPE_RETURN,
         amount_cents,
@@ -198,7 +256,7 @@ pub async fn refund(terminal: &Terminal, amount_cents: i64, ecr_ref_num: String,
         orig_ref_num: None,
         orig_trans_num: None,
     });
-    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state).await?;
+    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))
 }
 
@@ -210,6 +268,7 @@ pub async fn void_transaction(
     amount_cents: i64,
     orig_trans_num: Option<String>,
     on_state: Option<OnState>,
+    on_late: Option<LateCredit>,
 ) -> Result<CreditResponse, PaxError> {
     let fields = protocol::build_credit_fields(CreditFieldsInput {
         txn_type: protocol::TXN_TYPE_VOID,
@@ -220,7 +279,7 @@ pub async fn void_transaction(
         orig_ref_num: Some(orig_ref_num),
         orig_trans_num,
     });
-    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state).await?;
+    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))
 }
 
@@ -231,7 +290,7 @@ pub async fn batch_close(terminal: &Terminal) -> Result<BatchResponse, PaxError>
         Field::Single(config::protocol_version()),
         Field::Single(protocol::EDC_TYPE_ALL.to_string()),
     ];
-    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), None).await?;
+    let parsed = send_command(terminal, fields, config::payment_timeout_ms(), None, None).await?;
     Ok(protocol::parse_batch_response(&parsed))
 }
 
