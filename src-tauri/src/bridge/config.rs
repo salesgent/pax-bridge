@@ -127,6 +127,20 @@ pub fn protocol_version() -> String {
     std::env::var("PAX_PROTOCOL_VERSION").unwrap_or_else(|_| "1.54".to_string())
 }
 
+/// DoCredit transaction type used for a sale.
+///
+/// "01" is SALE and "02" is RETURN in every PAX implementation we could check,
+/// and a terminal that cannot reach its host will happily approve "02" offline
+/// while refusing "01" — which makes a refund look like a working sale. The
+/// override exists so the two can be compared on the terminal's own screen
+/// without a rebuild: set PAX_SALE_TXN_TYPE and read what the terminal says.
+pub fn sale_txn_type() -> String {
+    std::env::var("PAX_SALE_TXN_TYPE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| crate::bridge::protocol::TXN_TYPE_SALE.to_string())
+}
+
 /// Optional ENQ handshake for BroadPOS builds that require it.
 pub fn send_enq() -> bool {
     std::env::var("PAX_SEND_ENQ")
