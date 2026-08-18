@@ -344,6 +344,10 @@ pub struct InitializeInfo {
 pub struct CreditResponse {
     pub result_code: String,
     pub result_txt: String,
+    /// What the processor said, when the terminal got far enough to ask it —
+    /// e.g. "CONNECT ERROR" when the terminal could not reach the host at all.
+    pub host_response_code: String,
+    pub host_response_text: String,
     pub approved: bool,
     pub auth_code: String,
     pub host_ref_num: String,
@@ -417,6 +421,8 @@ pub fn parse_credit_response(parsed: &ParsedResponse) -> CreditResponse {
         approved: result_code == RESULT_CODE_APPROVED,
         result_code,
         result_txt: at(f, t01_res_field::RESULT_TXT),
+        host_response_code: at(&host, 0),
+        host_response_text: at(&host, 1),
         auth_code: at(&host, 2),
         host_ref_num: at(&host, 3),
         ref_num: at(&trace, 2),
