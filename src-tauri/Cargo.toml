@@ -1,6 +1,6 @@
 [package]
 name = "pax_bridge_desktop"
-version = "1.0.7"
+version = "1.0.0"
 description = "Salesgent Hardware Bridge"
 edition = "2021"
 license = "UNLICENSED"
