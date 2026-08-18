@@ -1,9 +1,14 @@
 name: Release (Tauri)
 
 # Builds macOS DMG (arm64 + x64) and Windows NSIS via tauri-action.
-# Tag push (v*) → build + publish. Manual run → artifacts only unless publish=true.
+#
+# Push to `pax-rust`  → auto-bump the version, tag it, build + publish a release.
+# Tag push (v*)       → build + publish that tag.
+# Manual run          → artifacts only unless publish=true.
 on:
   push:
+    branches:
+      - pax-rust
     tags:
       - "v*"
   workflow_dispatch:
@@ -13,11 +18,84 @@ on:
         type: boolean
         default: false
 
+# One release at a time — two pushes in quick succession must not race for the
+# same version number.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
+  version:
+    # Only for branch pushes. The bump commit carries [skip ci] so it does not
+    # trigger this workflow again.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick the next version and tag it
+        id: bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          CURRENT=$(node -p "require('./package.json').version")
+          # Ship the version already in the files if it has never been tagged
+          # (that is how the first release after a version reset goes out);
+          # otherwise take the next patch after the highest existing tag.
+          if git rev-parse -q --verify "refs/tags/v$CURRENT" >/dev/null; then
+            HIGHEST=$(git tag --list 'v*' | sed 's/^v//' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+            NEXT=$(node -p "const p='${HIGHEST}'.split('.').map(Number); p[2]+=1; p.join('.')")
+          else
+            NEXT="$CURRENT"
+          fi
+          echo "Releasing v$NEXT (files were at $CURRENT)"
+
+          node -e "
+            const fs = require('fs');
+            const v = '$NEXT';
+            for (const f of ['package.json', 'src-tauri/tauri.conf.json']) {
+              const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+              j.version = v;
+              fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
+            }
+          "
+          # Only the first `version =` line, which is this crate's own.
+          perl -0pi -e "s/^version = \"[^\"]+\"/version = \"$NEXT\"/m" src-tauri/Cargo.toml
+          perl -0pi -e "s/(name = \"pax_bridge_desktop\"\nversion = )\"[^\"]+\"/\${1}\"$NEXT\"/" src-tauri/Cargo.lock
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v$NEXT [skip ci]"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          git tag "v$NEXT"
+          git push origin "v$NEXT"
+
+          {
+            echo "version=$NEXT"
+            echo "tag=v$NEXT"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
+    # `version` is skipped for tag pushes and manual runs — build anyway.
+    if: always() && needs.version.result != 'failure' && needs.version.result != 'cancelled'
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +114,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha || github.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -106,7 +186,7 @@ jobs:
           fi
 
       - name: Build only (no publish)
-        if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.publish == true) }}
+        if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.publish == true || needs.version.outputs.tag) }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,7 +198,7 @@ jobs:
           args: ${{ matrix.args }}
 
       - name: Build and publish release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == true }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish == true || needs.version.outputs.tag }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,8 +210,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: .
-          tagName: ${{ github.ref_name }}
-          releaseName: "Salesgent Hardware Bridge ${{ github.ref_name }}"
+          tagName: ${{ needs.version.outputs.tag || github.ref_name }}
+          releaseName: "Salesgent Hardware Bridge ${{ needs.version.outputs.tag || github.ref_name }}"
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
@@ -141,7 +221,7 @@ jobs:
           args: ${{ matrix.args }}
 
       - name: Upload artifacts
-        if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.publish == true) }}
+        if: ${{ !(startsWith(github.ref, 'refs/tags/v') || inputs.publish == true || needs.version.outputs.tag) }}
         uses: actions/upload-artifact@v4
         with:
           name: bundles-${{ matrix.platform }}-${{ matrix.rust_target || 'native' }}
@@ -157,13 +237,13 @@ jobs:
     # Renames the uploaded assets to version-less names and writes the download
     # table. Keep the names in sync with:
     #   erp-frontend/src/modules/shared/paymentTerminal/bridgeDownload.js
-    if: always() && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: always() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || needs.version.outputs.tag)
+    needs: [version, build]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.version.outputs.tag || github.ref_name }}
       MAC_ARM: Salesgent-Pax-Bridge-macOS-Apple-Silicon.dmg
       MAC_INTEL: Salesgent-Pax-Bridge-macOS-Intel.dmg
       WINDOWS: Salesgent-Pax-Bridge-Windows-Setup.exe
