@@ -1,7 +1,7 @@
 {
   "name": "pax-bridge-desktop",
   "productName": "Salesgent Hardware Bridge",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Installable, auto-updating desktop app that runs the Salesgent PAX payment bridge on a store computer.",
   "author": "Salesgent",
   "license": "UNLICENSED",
