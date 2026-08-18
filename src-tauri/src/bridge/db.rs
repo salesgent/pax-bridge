@@ -1,5 +1,12 @@
-//! Flat-file JSON database — ports `bridge/index.js`'s terminals/transactions
-//! store byte-for-byte (same on-disk shape: `{ terminals, transactions, ecrSeq }`).
+//! Flat-file JSON database.
+//!
+//! Terminals and the ECR sequence live in `pax-db.json`. Transactions are a
+//! log, so they are written per day into `logs/transactions-YYYY-MM-DD.json`
+//! — one file per date, named by the date, which is what you want when
+//! reading back "what happened on the 18th" instead of scrolling one
+//! ever-growing file. Everything is still held in memory, so queries are
+//! unchanged; only the on-disk layout differs, and an older single-file
+//! database is split on first load.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -30,10 +37,32 @@ pub struct DbData {
     pub ecr_seq: HashMap<String, u32>,
 }
 
+/// What `pax-db.json` holds now: everything except the transaction log.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MainData {
+    #[serde(default)]
+    terminals: Vec<Terminal>,
+    #[serde(default, rename = "ecrSeq")]
+    ecr_seq: HashMap<String, u32>,
+}
+
 pub struct Db {
     file_path: PathBuf,
+    log_dir: PathBuf,
     pid: u32,
     data: DbData,
+    /// Dates (YYYY-MM-DD) whose log file needs rewriting, so a single new
+    /// transaction does not rewrite years of history.
+    dirty_days: std::collections::HashSet<String>,
+}
+
+/// The day a transaction belongs to, from its own `createdAt`.
+fn day_of(tx: &Map<String, Value>) -> String {
+    tx.get("createdAt")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() >= 10)
+        .map(|s| s[..10].to_string())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string())
 }
 
 fn json_number(v: Option<&Value>) -> Option<f64> {
@@ -109,28 +138,71 @@ impl Db {
     pub fn load(data_dir: &std::path::Path) -> Self {
         let _ = std::fs::create_dir_all(data_dir);
         let file_path = data_dir.join("pax-db.json");
+        let log_dir = data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
         let mut needs_persist = false;
+        let mut dirty_days = std::collections::HashSet::new();
 
-        let data = if file_path.exists() {
-            match std::fs::read_to_string(&file_path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<DbData>(&c).ok())
-            {
-                Some(d) => d,
-                None => {
-                    tracing::error!("[db] failed to load, starting fresh");
+        let raw = std::fs::read_to_string(&file_path).ok();
+        let mut data = DbData::default();
+
+        if let Some(text) = raw.as_deref() {
+            match serde_json::from_str::<DbData>(text) {
+                Ok(parsed) => {
+                    data.terminals = parsed.terminals;
+                    data.ecr_seq = parsed.ecr_seq;
+                    // Pre-log-split database: move its transactions into the
+                    // dated files, then drop them from the main file.
+                    if !parsed.transactions.is_empty() {
+                        tracing::info!("[db] migrating {} transactions into dated log files", parsed.transactions.len());
+                        for tx in &parsed.transactions {
+                            dirty_days.insert(day_of(tx));
+                        }
+                        data.transactions = parsed.transactions;
+                        needs_persist = true;
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("[db] failed to load ({}), starting fresh", err);
                     let corrupt_path = format!("{}.corrupt-{}", file_path.display(), chrono::Utc::now().timestamp_millis());
                     let _ = std::fs::rename(&file_path, &corrupt_path);
                     needs_persist = true;
-                    DbData::default()
                 }
             }
         } else {
             needs_persist = true;
-            DbData::default()
-        };
+        }
 
-        let db = Db { file_path, pid: std::process::id(), data };
+        // Day files, newest first — the order the rest of the code expects.
+        let mut day_files: Vec<PathBuf> = std::fs::read_dir(&log_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("transactions-") && n.ends_with(".json"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        day_files.sort();
+        day_files.reverse();
+
+        for path in day_files {
+            match std::fs::read_to_string(&path).ok().map(|c| serde_json::from_str::<Vec<Map<String, Value>>>(&c)) {
+                Some(Ok(mut rows)) => data.transactions.append(&mut rows),
+                Some(Err(err)) => tracing::error!("[db] skipping unreadable log {}: {}", path.display(), err),
+                None => {}
+            }
+        }
+        data.transactions.sort_by(|a, b| {
+            b.get("createdAt").and_then(Value::as_str).unwrap_or("").cmp(a.get("createdAt").and_then(Value::as_str).unwrap_or(""))
+        });
+
+        let db = Db { file_path, log_dir, pid: std::process::id(), data, dirty_days };
         if needs_persist {
             db.persist();
         }
@@ -138,21 +210,34 @@ impl Db {
     }
 
     /// Atomically persist current in-memory data (write to tmp, then rename).
+    ///
+    /// The main file carries terminals + ECR sequence; transactions go to the
+    /// dated log files, and only the days touched since the last write are
+    /// rewritten.
     fn persist(&self) {
-        let snapshot = match serde_json::to_string_pretty(&self.data) {
-            Ok(s) => s,
-            Err(err) => {
-                tracing::error!("[db] persist failed (serialize): {}", err);
-                return;
+        let main = MainData { terminals: self.data.terminals.clone(), ecr_seq: self.data.ecr_seq.clone() };
+        match serde_json::to_string_pretty(&main) {
+            Ok(snapshot) => self.write_atomic(&self.file_path, &snapshot),
+            Err(err) => tracing::error!("[db] persist failed (serialize): {}", err),
+        }
+
+        for day in &self.dirty_days {
+            let rows: Vec<&Map<String, Value>> = self.data.transactions.iter().filter(|t| &day_of(t) == day).collect();
+            match serde_json::to_string_pretty(&rows) {
+                Ok(snapshot) => self.write_atomic(&self.log_dir.join(format!("transactions-{}.json", day)), &snapshot),
+                Err(err) => tracing::error!("[db] log persist failed (serialize): {}", err),
             }
-        };
-        let tmp = self.file_path.with_extension(format!("json.tmp-{}", self.pid));
-        if let Err(err) = std::fs::write(&tmp, &snapshot) {
-            tracing::error!("[db] persist failed: {}", err);
+        }
+    }
+
+    fn write_atomic(&self, path: &std::path::Path, contents: &str) {
+        let tmp = path.with_extension(format!("json.tmp-{}", self.pid));
+        if let Err(err) = std::fs::write(&tmp, contents) {
+            tracing::error!("[db] persist failed ({}): {}", path.display(), err);
             return;
         }
-        if let Err(err) = std::fs::rename(&tmp, &self.file_path) {
-            tracing::error!("[db] persist failed: {}", err);
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            tracing::error!("[db] persist failed ({}): {}", path.display(), err);
         }
     }
 
@@ -268,6 +353,7 @@ impl Db {
         for (k, v) in tx {
             record.insert(k, v);
         }
+        self.dirty_days.insert(day_of(&record));
         self.data.transactions.insert(0, record.clone()); // newest first
         self.persist();
         record
@@ -284,6 +370,9 @@ impl Db {
         }
         tx.insert("updatedAt".into(), Value::String(chrono::Utc::now().to_rfc3339()));
         let result = tx.clone();
+        // A transaction stays in the log file of the day it was created, so a
+        // late update rewrites that day, not today.
+        self.dirty_days.insert(day_of(&result));
         self.persist();
         Some(result)
     }
@@ -338,15 +427,19 @@ impl Db {
     /// Mark a set of transaction ids as settled (after a successful batch close).
     pub fn mark_settled(&mut self, ids: &[String], batch_info: Value) {
         let set: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let mut touched = Vec::new();
         for tx in self.data.transactions.iter_mut() {
             if let Some(id) = tx.get("id").and_then(Value::as_str) {
                 if set.contains(id) {
                     tx.insert("settled".into(), Value::Bool(true));
                     tx.insert("batchInfo".into(), batch_info.clone());
                     tx.insert("updatedAt".into(), Value::String(chrono::Utc::now().to_rfc3339()));
+                    touched.push(day_of(tx));
                 }
             }
         }
+        // A batch spans whatever days it settles.
+        self.dirty_days.extend(touched);
         self.persist();
     }
 }
