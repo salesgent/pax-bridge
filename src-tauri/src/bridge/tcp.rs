@@ -9,6 +9,7 @@ use crate::bridge::protocol::{self, OnState, ParsedResponse, PaxError};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 fn hex(buf: &[u8]) -> String {
     buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ")
@@ -34,6 +35,10 @@ fn map_connect_err(err: &std::io::Error) -> PaxError {
 
 /// Send a command to a TCP terminal and await its framed response.
 /// `expected` is the response command code to validate against (e.g. "T01").
+/// `cancel` carries a frame (A14) to push down this same connection while the
+/// terminal is still prompting. BroadPOS only services one ECR connection at a
+/// time, so a cancel opened on a second socket is never read — it has to ride
+/// the socket the transaction is already on.
 pub async fn send_command(
     ip: &str,
     port: u16,
@@ -41,9 +46,10 @@ pub async fn send_command(
     expected: Option<&str>,
     timeout_ms: u64,
     on_state: Option<OnState>,
+    cancel: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<ParsedResponse, PaxError> {
     let where_ = format!("{}:{}", ip, port);
-    let fut = send_command_inner(ip, port, request, expected, &on_state, &where_);
+    let fut = send_command_inner(ip, port, request, expected, &on_state, &where_, cancel);
     match tokio::time::timeout(Duration::from_millis(timeout_ms), fut).await {
         Ok(res) => res,
         Err(_) => Err(PaxError::new("TIMEOUT", format!("No complete response within {}ms", timeout_ms))),
@@ -57,6 +63,7 @@ async fn send_command_inner(
     expected: Option<&str>,
     on_state: &Option<OnState>,
     where_: &str,
+    mut cancel: Option<mpsc::Receiver<Vec<u8>>>,
 ) -> Result<ParsedResponse, PaxError> {
     protocol::fire_state(on_state, "SENDING");
     tracing::debug!("Connecting to terminal {}", where_);
@@ -86,10 +93,33 @@ async fn send_command_inner(
     let mut first_byte = true;
 
     loop {
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| PaxError::new("SOCKET_ERROR", format!("Socket error: {}", e)))?;
+        let n = loop {
+            let cancel_frame = async {
+                match cancel.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    // Nothing to cancel with: park this branch forever.
+                    None => std::future::pending().await,
+                }
+            };
+
+            tokio::select! {
+                biased;
+                frame = cancel_frame => {
+                    // One cancel per command — drop the channel either way so a
+                    // closed sender cannot spin this branch.
+                    cancel = None;
+                    if let Some(frame) = frame {
+                        tracing::debug!("{}  cancel {} bytes RAW: {}", where_, frame.len(), hex(&frame));
+                        if let Err(e) = stream.write_all(&frame).await {
+                            tracing::warn!("{}  failed to write cancel: {}", where_, e);
+                        }
+                    }
+                }
+                read = stream.read(&mut chunk) => {
+                    break read.map_err(|e| PaxError::new("SOCKET_ERROR", format!("Socket error: {}", e)))?;
+                }
+            }
+        };
         if n == 0 {
             return Err(PaxError::new("CONNECTION_CLOSED", "Terminal closed the connection before a full response"));
         }
@@ -105,6 +135,15 @@ async fn send_command_inner(
             let got = parsed.fields.first().cloned().unwrap_or_default();
             tracing::debug!("{}  response=\"{}\"", where_, got);
             if let Some(exp) = expected {
+                // A cancel is acknowledged with its own A15 frame on this same
+                // socket, ahead of the transaction's real response. Drop it and
+                // keep reading for what we actually asked for.
+                if got != exp && got == protocol::RESPONSE_CANCEL {
+                    tracing::debug!("{}  cancel acknowledged, still waiting for {}", where_, exp);
+                    let _ = stream.write_all(&[protocol::ACK]).await;
+                    buf.clear();
+                    continue;
+                }
                 if got != exp {
                     return Err(PaxError::new("UNEXPECTED_RESPONSE", format!("Expected {} response, got \"{}\"", exp, got))
                         .with_raw(serde_json::Value::String(parsed.raw.clone())));
