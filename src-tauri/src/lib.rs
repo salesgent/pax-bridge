@@ -495,6 +495,19 @@ async fn update_download(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn update_install(app: AppHandle) -> Result<(), String> {
+    install_update(app, false).await
+}
+
+/// Marker written just before an automatic restart, so the relaunched app comes
+/// back to the tray instead of popping its window in front of whatever the
+/// cashier is doing. Consumed on the next launch.
+fn silent_relaunch_marker(app: &AppHandle) -> std::path::PathBuf {
+    app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir()).join(".relaunch-silently")
+}
+
+/// `silent` restarts without showing the window afterwards — used by the
+/// automatic updater, never by the button the user just clicked.
+async fn install_update(app: AppHandle, silent: bool) -> Result<(), String> {
     let state = app.state::<UpdaterState>();
     let bytes = state
         .downloaded
@@ -535,10 +548,58 @@ async fn update_install(app: AppHandle) -> Result<(), String> {
         })?;
 
     let _ = app.emit("update:event", json!({ "type": "restarting" }));
+    if silent {
+        let _ = std::fs::write(silent_relaunch_marker(&app), "1");
+    }
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     tracing::info!("[updater] installed, restarting");
     app.restart();
+}
+
+/// How long after launch the first automatic check runs, and how often it
+/// repeats afterwards. Long enough that a store opening for the day is not
+/// competing with a download.
+const AUTO_UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
+const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How often to re-check whether the terminal went idle, once an update is
+/// downloaded and only the restart is left.
+const AUTO_UPDATE_IDLE_POLL: Duration = Duration::from_secs(30);
+
+/// Download and install new versions on their own, restarting the app when it
+/// is safe to do so.
+///
+/// The user still sees it happen — the same toasts a manual update shows — but
+/// never has to click anything. A restart is held back while any terminal has
+/// a command in flight: relaunching mid-authorization would drop the socket
+/// the late-result/auto-void logic depends on.
+async fn auto_update_loop(app: AppHandle) {
+    tokio::time::sleep(AUTO_UPDATE_FIRST_DELAY).await;
+    loop {
+        if read_settings(&app).get("autoUpdate").and_then(Value::as_bool).unwrap_or(true) {
+            if let Err(err) = auto_update_once(app.clone()).await {
+                tracing::info!("[updater] automatic update skipped: {err}");
+            }
+        }
+        tokio::time::sleep(AUTO_UPDATE_INTERVAL).await;
+    }
+}
+
+async fn auto_update_once(app: AppHandle) -> Result<(), String> {
+    let found = update_check(app.clone()).await?;
+    if !found.get("available").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(());
+    }
+
+    update_download(app.clone()).await?;
+
+    // Wait out any live payment rather than yanking the bridge from under it.
+    while bridge::transport::any_in_flight() {
+        tracing::info!("[updater] update ready, waiting for the terminal to go idle");
+        tokio::time::sleep(AUTO_UPDATE_IDLE_POLL).await;
+    }
+
+    install_update(app, true).await
 }
 
 // ---------------------------------------------------------------------------
@@ -652,8 +713,20 @@ pub fn run() {
                 std::env::set_var("PORT", port.to_string());
             }
 
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
+            // A window that was closed by the automatic updater comes back the
+            // way it went: in the tray, out of the cashier's way.
+            let relaunched_silently = {
+                let marker = silent_relaunch_marker(&handle);
+                let found = marker.exists();
+                if found {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                found
+            };
+            if !relaunched_silently {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
             }
 
             if start_on_launch {
@@ -661,6 +734,10 @@ pub fn run() {
                 let rt2 = runtime.clone();
                 tauri::async_runtime::spawn(async move { start_bridge_internal(app2, rt2).await });
             }
+
+            // Keeps the store on the current version without anyone clicking.
+            let app_updates = handle.clone();
+            tauri::async_runtime::spawn(async move { auto_update_loop(app_updates).await });
 
             Ok(())
         })

@@ -145,6 +145,14 @@ pub fn is_busy(terminal: &Terminal) -> bool {
     guard.get(&key).map(|q| q.pending.load(Ordering::SeqCst) > 0).unwrap_or(false)
 }
 
+/// True if any terminal has a command in flight/queued.
+///
+/// Used to hold back an automatic update+restart while a card prompt is live.
+pub fn any_in_flight() -> bool {
+    let guard = queues().lock().unwrap();
+    guard.values().any(|q| q.pending.load(Ordering::SeqCst) > 0)
+}
+
 struct PendingGuard(Arc<TerminalQueue>);
 impl Drop for PendingGuard {
     fn drop(&mut self) {
