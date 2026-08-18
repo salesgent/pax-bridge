@@ -208,13 +208,16 @@ function hideToast() {
   toast.classList.remove('is-open');
 }
 
-function showToast(title, msg, { actions = [], progress = false, kind = 'info', autoHideMs = 0 } = {}) {
+function showToast(title, msg, { actions = [], progress = false, indeterminate = false, kind = 'info', autoHideMs = 0, dismissible = true } = {}) {
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
 
   $('toastTitle').textContent = title;
   const text = String(msg ?? '');
   $('toastMsg').textContent = text.length > 300 ? `${text.slice(0, 300)}…` : text;
   $('toastProgress').hidden = !progress;
+  $('toastProgress').classList.toggle('is-indeterminate', progress && indeterminate);
+  if (progress && indeterminate) $('toastBar').style.width = '100%';
+  $('toastClose').hidden = !dismissible;
 
   toast.classList.remove('is-info', 'is-ok', 'is-warn', 'is-err');
   toast.classList.add(`is-${kind}`, 'is-open');
@@ -270,24 +273,73 @@ pax.updates.onEvent((e) => {
         kind: 'warn',
         actions: [
           { label: 'Later', onClick: hideToast },
-          { label: 'Download', primary: true, onClick: () => pax.updates.download() },
+          {
+            label: 'Download',
+            primary: true,
+            onClick: () => {
+              // Show movement immediately — the first byte can be seconds away.
+              showToast(`Downloading v${e.version}…`, 'Starting download…', {
+                kind: 'info',
+                progress: true,
+                indeterminate: true,
+              });
+              pax.updates.download();
+            },
+          },
         ],
       });
       break;
-    case 'progress':
-      showToast('Downloading update…', `${e.percent}% · ${(e.bytesPerSecond / 1e6).toFixed(1)} MB/s`, {
+    case 'download-start':
+      showToast(`Downloading v${e.version}…`, 'Starting download…', {
+        kind: 'info',
+        progress: true,
+        indeterminate: true,
+      });
+      break;
+    case 'progress': {
+      const size = e.total ? ` of ${(e.total / 1e6).toFixed(1)} MB` : '';
+      showToast('Downloading update…', `${e.percent}%${size} · ${(e.bytesPerSecond / 1e6).toFixed(1)} MB/s`, {
         kind: 'info',
         progress: true,
       });
       $('toastBar').style.width = `${e.percent}%`;
       break;
+    }
     case 'downloaded':
       showToast(`Ready to install — v${e.version}`, 'The update will apply on restart.', {
         kind: 'ok',
         actions: [
           { label: 'Later', onClick: hideToast },
-          { label: 'Restart & install', primary: true, onClick: () => pax.updates.install() },
+          {
+            label: 'Restart & install',
+            primary: true,
+            onClick: () => {
+              showToast('Installing update…', 'Please wait — the app will restart on its own.', {
+                kind: 'info',
+                progress: true,
+                indeterminate: true,
+                dismissible: false,
+              });
+              pax.updates.install();
+            },
+          },
         ],
+      });
+      break;
+    case 'installing':
+      showToast('Installing update…', 'Please wait — the app will restart on its own.', {
+        kind: 'info',
+        progress: true,
+        indeterminate: true,
+        dismissible: false,
+      });
+      break;
+    case 'restarting':
+      showToast('Restarting…', 'Reopening with the new version.', {
+        kind: 'ok',
+        progress: true,
+        indeterminate: true,
+        dismissible: false,
       });
       break;
     case 'dev':

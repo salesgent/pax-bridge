@@ -116,7 +116,7 @@ async fn start_bridge_internal(app: AppHandle, rt: Arc<BridgeRuntime>) {
         status.port = port;
     }
     set_status(&app, &rt, "starting").await;
-    push_log(&app, &rt, "sys", format!("Starting Salesgent Pax Bridge on port {}…", port)).await;
+    push_log(&app, &rt, "sys", format!("Starting Salesgent Hardware Bridge on port {}…", port)).await;
 
     let token = CancellationToken::new();
     {
@@ -430,8 +430,22 @@ async fn update_download(app: AppHandle) -> Result<(), String> {
     let pending = state.pending.lock().await;
     let update = pending.as_ref().ok_or("No update available — check for updates first.")?;
 
+    // Tell the UI the moment the click lands: connecting to GitHub + TLS can
+    // take a few seconds before the first chunk arrives, and without this the
+    // window looks frozen.
+    let _ = app.emit(
+        "update:event",
+        json!({ "type": "download-start", "version": update.version.clone() }),
+    );
+
     let started = Instant::now();
     let received = AtomicU64::new(0);
+    // Chunks arrive thousands of times per second; emitting an event for each
+    // one floods the IPC channel and the webview never gets to paint. Emit
+    // only when the whole percent changes (or every 150ms when the server
+    // sends no content-length).
+    let last_percent = AtomicU64::new(u64::MAX);
+    let last_emit_ms = AtomicU64::new(0);
     let app_for_chunk = app.clone();
 
     let bytes = update
@@ -442,11 +456,23 @@ async fn update_download(app: AppHandle) -> Result<(), String> {
                     .filter(|len| *len > 0)
                     .map(|len| ((total as f64 / len as f64) * 100.0).min(100.0).round() as u64)
                     .unwrap_or(0);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                let changed = last_percent.swap(percent, Ordering::SeqCst) != percent;
+                if !changed && elapsed_ms.saturating_sub(last_emit_ms.load(Ordering::SeqCst)) < 150 {
+                    return;
+                }
+                last_emit_ms.store(elapsed_ms, Ordering::SeqCst);
                 let secs = started.elapsed().as_secs_f64();
                 let bps = if secs > 0.0 { total as f64 / secs } else { 0.0 };
                 let _ = app_for_chunk.emit(
                     "update:event",
-                    json!({ "type": "progress", "percent": percent, "bytesPerSecond": bps }),
+                    json!({
+                        "type": "progress",
+                        "percent": percent,
+                        "bytesPerSecond": bps,
+                        "downloaded": total,
+                        "total": content_length,
+                    }),
                 );
             },
             || {},
@@ -460,6 +486,7 @@ async fn update_download(app: AppHandle) -> Result<(), String> {
         })?;
 
     let version = update.version.clone();
+    drop(pending);
     *state.downloaded.lock().await = Some(bytes);
     tracing::info!("[updater] downloaded v{version}, awaiting install");
     let _ = app.emit("update:event", json!({ "type": "downloaded", "version": version }));
@@ -476,16 +503,10 @@ async fn update_install(app: AppHandle) -> Result<(), String> {
         .take()
         .ok_or("No update downloaded — download it first.")?;
 
-    {
-        let pending = state.pending.lock().await;
-        let update = pending.as_ref().ok_or("No update available — check for updates first.")?;
-        update.install(bytes).map_err(|e| {
-            let msg = e.to_string();
-            tracing::error!("[updater] install failed: {msg}");
-            let _ = app.emit("update:event", json!({ "type": "error", "message": msg.clone() }));
-            msg
-        })?;
-    }
+    let _ = app.emit("update:event", json!({ "type": "installing" }));
+    // Give the webview a frame to paint the "Installing…" state before the
+    // extract/replace work below hogs the process.
+    tokio::time::sleep(Duration::from_millis(120)).await;
 
     // The bridge is a local server; stop it cleanly so the relaunched instance
     // can bind the same port instead of hitting EADDRINUSE.
@@ -495,6 +516,26 @@ async fn update_install(app: AppHandle) -> Result<(), String> {
     };
     is_quitting.store(true, Ordering::SeqCst);
     stop_bridge_internal(app.clone(), runtime).await;
+
+    // `install` unpacks the archive and swaps the app bundle synchronously —
+    // run it off the async runtime so events already queued still get through.
+    let update = {
+        let pending = state.pending.lock().await;
+        pending.as_ref().ok_or("No update available — check for updates first.")?.clone()
+    };
+    let app_for_install = app.clone();
+    tauri::async_runtime::spawn_blocking(move || update.install(bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            let msg = e.to_string();
+            tracing::error!("[updater] install failed: {msg}");
+            let _ = app_for_install.emit("update:event", json!({ "type": "error", "message": msg.clone() }));
+            msg
+        })?;
+
+    let _ = app.emit("update:event", json!({ "type": "restarting" }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     tracing::info!("[updater] installed, restarting");
     app.restart();
@@ -566,7 +607,7 @@ pub fn run() {
                 let is_quitting_for_tray = is_quitting.clone();
                 TrayIconBuilder::with_id("main-tray")
                     .icon(app.default_window_icon().cloned().expect("default window icon should be embedded via tauri.conf.json bundle.icon"))
-                    .tooltip("Salesgent Pax Bridge")
+                    .tooltip("Salesgent Hardware Bridge")
                     .menu(&tray_menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -637,7 +678,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building the Salesgent Pax Bridge app")
+        .expect("error while building the Salesgent Hardware Bridge app")
         .run(|_app_handle, event| {
             if let RunEvent::ExitRequested { .. } = event {
                 // Nothing to veto here — quitting always tears the bridge down via

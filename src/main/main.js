@@ -6,7 +6,7 @@ const { Bridge } = require('./bridge');
 const { createTray } = require('./tray');
 const { initUpdater } = require('./updater');
 
-const APP_TITLE = 'Salesgent Pax Bridge';
+const APP_TITLE = 'Salesgent Hardware Bridge';
 // Fixed on purpose — not user-configurable (see registerIpc's settings:set guard).
 const BRIDGE_PORT = 5000;
 
@@ -157,7 +157,7 @@ function registerIpc() {
     if (!content) return { ok: false, reason: 'empty' };
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
-      title: 'Save Salesgent Pax Bridge logs',
+      title: 'Save Salesgent Hardware Bridge logs',
       defaultPath: path.join(app.getPath('desktop'), `salesgent-pax-bridge-logs-${stamp}.log`),
       filters: [{ name: 'Log file', extensions: ['log', 'txt'] }],
     });

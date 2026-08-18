@@ -97,7 +97,7 @@ class Bridge {
     if (this.proc) await this.stop();
     this.port = Number(port) || 5000;
     this._setStatus('starting');
-    this._pushLog(`Starting Salesgent Pax Bridge on port ${this.port}…`, 'sys');
+    this._pushLog(`Starting Salesgent Hardware Bridge on port ${this.port}…`, 'sys');
 
     const env = {
       ...process.env,

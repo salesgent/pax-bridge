@@ -1,5 +1,5 @@
 appId: com.salesgent.paxbridge
-productName: Salesgent Pax Bridge
+productName: Salesgent Hardware Bridge
 copyright: Copyright © Salesgent
 
 directories:
@@ -72,7 +72,7 @@ mac:
 dmg:
   # ${arch} required: arm64 + x64 dmg builds run in parallel and must not share
   # the same hdiutil volume name.
-  title: "Salesgent Pax Bridge ${version} ${arch}"
+  title: "Salesgent Hardware Bridge ${version} ${arch}"
 
 win:
   target:
@@ -92,7 +92,7 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: Salesgent Pax Bridge
+  shortcutName: Salesgent Hardware Bridge
   # Keep differential packaging (blockmap) for small auto-updates.
   differentialPackage: true
 

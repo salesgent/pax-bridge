@@ -131,7 +131,7 @@ jobs:
         with:
           projectPath: .
           tagName: ${{ github.ref_name }}
-          releaseName: "Salesgent Pax Bridge ${{ github.ref_name }}"
+          releaseName: "Salesgent Hardware Bridge ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
@@ -251,7 +251,7 @@ jobs:
           # the logo that shipped with this version, even after newer releases.
           LOGO_URL="https://github.com/$REPO/releases/download/$TAG/$LOGO"
           {
-            echo "<img src=\"$LOGO_URL\" alt=\"Salesgent Pax Bridge\" width=\"96\" />"
+            echo "<img src=\"$LOGO_URL\" alt=\"Salesgent Hardware Bridge\" width=\"96\" />"
             echo
             echo '## Download the right file for your computer'
             echo
