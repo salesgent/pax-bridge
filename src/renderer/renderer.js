@@ -190,9 +190,26 @@ $('btnDownloadLogs').addEventListener('click', async (e) => {
   const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Saving…';
   try {
+    // alert() is a no-op in the Tauri webview — the file saved fine but the
+    // click looked like it did nothing. Report through the toast instead.
     const res = await pax.logs.download();
-    if (res.ok) alert(`Logs saved to:\n${res.filePath}`);
-    else if (res.reason === 'empty') alert('No logs yet — start the bridge and process a payment first.');
+    if (res.ok) {
+      showToast('Logs saved', res.filePath, {
+        kind: 'ok',
+        autoHideMs: 12000,
+        actions: [
+          {
+            label: 'Show in folder',
+            primary: true,
+            onClick: () => pax.app.openExternal(`file://${res.filePath.replace(/\/[^/]+$/, '')}`),
+          },
+        ],
+      });
+    } else if (res.reason === 'empty') {
+      showToast('No logs yet', 'Start the bridge and process a payment first.', { kind: 'warn', autoHideMs: 5000 });
+    } else {
+      showToast('Could not save logs', res?.message || 'Unknown error.', { kind: 'err', autoHideMs: 6000 });
+    }
   } finally {
     btn.disabled = false; btn.textContent = original;
   }
