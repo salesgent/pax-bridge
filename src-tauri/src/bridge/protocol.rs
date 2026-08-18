@@ -36,8 +36,6 @@ pub const EOT: u8 = 0x04; // End of transmission
 pub const COMMAND_INITIALIZE: &str = "A00"; // Initialize / ping terminal   -> A01
 #[allow(dead_code)]
 pub const COMMAND_GET_INPUT: &str = "A08"; // Get input (optional)          -> A09
-pub const RESPONSE_CANCEL: &str = "A15"; // Ack of A14, may arrive before the txn response
-pub const COMMAND_CANCEL: &str = "A14"; // Cancel the transaction on the terminal -> A15
 pub const COMMAND_DO_CREDIT: &str = "T00"; // DoCredit (sale/auth/return/void/postauth) -> T01
 pub const COMMAND_BATCH_CLOSE: &str = "B00"; // Batch close / settle        -> B01
 
@@ -46,7 +44,6 @@ pub fn response_for(command: &str) -> Option<&'static str> {
     match command {
         "A00" => Some("A01"),
         "A08" => Some("A09"),
-        "A14" => Some("A15"),
         "T00" => Some("T01"),
         "B00" => Some("B01"),
         _ => None,
@@ -56,18 +53,12 @@ pub fn response_for(command: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Transaction type sub-codes for DoCredit (T00), field #3.
 // ---------------------------------------------------------------------------
-// These were off by one place for every type: SALE was sending "02", which is
-// RETURN — every "sale" reached the terminal as a refund (the screen reads
-// CREDIT RETURN) and every void went out as a post-auth.
-pub const TXN_TYPE_SALE: &str = "01"; // Sale / redeem
-pub const TXN_TYPE_RETURN: &str = "02"; // Return / refund
+pub const TXN_TYPE_AUTH: &str = "01"; // Pre-authorization
+pub const TXN_TYPE_SALE: &str = "02"; // Sale / DoCredit
+pub const TXN_TYPE_RETURN: &str = "03"; // Return / refund
+pub const TXN_TYPE_VOID: &str = "04"; // Void a previous transaction
 #[allow(dead_code)]
-pub const TXN_TYPE_AUTH: &str = "03"; // Pre-authorization
-#[allow(dead_code)]
-pub const TXN_TYPE_POSTAUTH: &str = "04"; // Post-authorization (capture)
-/// Voiding a sale by its original ref number. "16" is the generic VOID; "17"
-/// is the sale-specific one, which is what every void here reverses.
-pub const TXN_TYPE_VOID: &str = "17"; // V/SALE — void of a sale
+pub const TXN_TYPE_POSTAUTH: &str = "05"; // Post-authorization (capture)
 
 // ---------------------------------------------------------------------------
 // Result / EDC codes
@@ -344,10 +335,6 @@ pub struct InitializeInfo {
 pub struct CreditResponse {
     pub result_code: String,
     pub result_txt: String,
-    /// What the processor said, when the terminal got far enough to ask it —
-    /// e.g. "CONNECT ERROR" when the terminal could not reach the host at all.
-    pub host_response_code: String,
-    pub host_response_text: String,
     pub approved: bool,
     pub auth_code: String,
     pub host_ref_num: String,
@@ -421,8 +408,6 @@ pub fn parse_credit_response(parsed: &ParsedResponse) -> CreditResponse {
         approved: result_code == RESULT_CODE_APPROVED,
         result_code,
         result_txt: at(f, t01_res_field::RESULT_TXT),
-        host_response_code: at(&host, 0),
-        host_response_text: at(&host, 1),
         auth_code: at(&host, 2),
         host_ref_num: at(&host, 3),
         ref_num: at(&trace, 2),

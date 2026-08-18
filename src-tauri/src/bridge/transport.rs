@@ -62,30 +62,17 @@ static QUEUES: OnceLock<StdMutex<HashMap<String, Arc<TerminalQueue>>>> = OnceLoc
 /// Lets `cancel()` abort a card prompt the cashier no longer wants to wait on.
 static CANCELS: OnceLock<StdMutex<HashMap<String, CancellationToken>>> = OnceLock::new();
 
-/// Senders that push a frame into the connection a command is currently on,
-/// keyed by terminal. This is how A14 reaches the terminal: BroadPOS services
-/// one ECR connection at a time, so a cancel sent on a fresh socket is never
-/// read.
-static CANCEL_FRAMES: OnceLock<StdMutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>>> = OnceLock::new();
-
 fn cancels() -> &'static StdMutex<HashMap<String, CancellationToken>> {
     CANCELS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn cancel_frames() -> &'static StdMutex<HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>>> {
-    CANCEL_FRAMES.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
 /// Stop waiting on the in-flight command for this terminal, if any.
 ///
-/// This is the POS-side half of a cancel: it releases whoever is awaiting the
-/// terminal's reply. It does not touch the terminal — pair it with
-/// [`cancel_on_terminal`], which pushes the A14 down the live connection to
-/// clear the card prompt. The command keeps running on its socket either way,
-/// so whatever the
-/// terminal finally reports is handed to the `on_late` hook the caller passed
-/// to sale/refund/void, which is what lets an unwanted approval be voided
-/// instead of silently charged.
+/// The terminal keeps its own card prompt until it times out or the red Cancel
+/// key is pressed, so this does NOT stop the customer from paying. The command
+/// therefore keeps running on its socket: whatever the terminal finally reports
+/// is handed to the `on_late` hook the caller passed to sale/refund/void, which
+/// is what lets an unwanted approval be voided instead of silently charged.
 /// Returns false if nothing was in flight.
 pub fn cancel(terminal: &Terminal) -> bool {
     let key = Target::from_terminal(terminal).key();
@@ -99,39 +86,12 @@ pub fn cancel(terminal: &Terminal) -> bool {
     }
 }
 
-/// Tell the terminal itself to abort what it is prompting for (A14 CANCEL).
-///
-/// Sent on its own connection, deliberately bypassing the per-terminal queue:
-/// the queue lock is held by the very command we are aborting, so waiting for
-/// it would deadlock until the sale timed out — the whole thing we are trying
-/// to avoid. The terminal answers A15 and drops back to idle, which also makes
-/// the pending T00 come back as a non-approval through the normal path.
-///
-/// Serial terminals cannot take a second command while one is on the wire (the
-/// port is held exclusively), so USB stays a device-side cancel.
-pub async fn cancel_on_terminal(terminal: &Terminal) -> Result<(), PaxError> {
-    let key = Target::from_terminal(terminal).key();
-    let sender = { cancel_frames().lock().unwrap().get(&key).cloned() };
-    let sender = sender.ok_or_else(|| {
-        PaxError::new("NOT_IN_FLIGHT", "No command is on the wire for this terminal to cancel.")
-    })?;
-
-    let fields =
-        vec![Field::Single(protocol::COMMAND_CANCEL.to_string()), Field::Single(config::protocol_version())];
-
-    sender.try_send(protocol::build_message(&fields)).map_err(|e| {
-        PaxError::new("CANCEL_FAILED", "Could not hand the cancel to the terminal connection.")
-            .with_cause(e.to_string())
-    })
-}
-
 /// Removes this terminal's cancel token when the command finishes, so a later
 /// cancel can never abort an unrelated command.
 struct CancelGuard(String);
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         cancels().lock().unwrap().remove(&self.0);
-        cancel_frames().lock().unwrap().remove(&self.0);
     }
 }
 
@@ -199,9 +159,6 @@ async fn send_command(
     // belongs to the command actually on the wire.
     let token = CancellationToken::new();
     cancels().lock().unwrap().insert(key.clone(), token.clone());
-    // Depth 1: one cancel is all a single command can use.
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-    cancel_frames().lock().unwrap().insert(key.clone(), cancel_tx);
     let cancel_guard = CancelGuard(key);
 
     // The wire work owns the guards so it can outlive a cancel: closing the
@@ -217,12 +174,8 @@ async fn send_command(
         let _cancel_guard = cancel_guard;
 
         let result = match target {
-            Target::Tcp { ip, port } => {
-                tcp::send_command(&ip, port, &request, expected.as_deref(), timeout_ms, on_state, Some(cancel_rx)).await
-            }
-            Target::Usb { path, baud_rate } => {
-                serial::send_command(&path, baud_rate, request, expected, timeout_ms, on_state, Some(cancel_rx)).await
-            }
+            Target::Tcp { ip, port } => tcp::send_command(&ip, port, &request, expected.as_deref(), timeout_ms, on_state).await,
+            Target::Usb { path, baud_rate } => serial::send_command(&path, baud_rate, request, expected, timeout_ms, on_state).await,
         };
         let _ = tx.send(result);
     });
@@ -244,7 +197,10 @@ async fn send_command(
         });
     }
 
-    Err(PaxError::new("CANCELED", "Cancelled from the point of sale."))
+    Err(PaxError::new(
+        "CANCELED",
+        "Stopped waiting from the point of sale. The terminal keeps its card prompt until it times out or its red Cancel key is pressed.",
+    ))
 }
 
 /// List serial ports available on the host (for the "detect USB device" UI).

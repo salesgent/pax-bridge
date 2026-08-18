@@ -78,9 +78,6 @@ fn classify_runtime_err(path: &str, msg: &str) -> PaxError {
 }
 
 /// Send a command over serial and await its framed response.
-/// `cancel` carries a frame (A14) to write into the open port while the
-/// terminal is still prompting — the same port the transaction is on, since a
-/// serial link admits only one holder.
 pub async fn send_command(
     path: &str,
     baud_rate: u32,
@@ -88,14 +85,13 @@ pub async fn send_command(
     expected: Option<String>,
     timeout_ms: u64,
     on_state: Option<OnState>,
-    cancel: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 ) -> Result<ParsedResponse, PaxError> {
     let path_owned = path.to_string();
     let baud = if baud_rate == 0 { DEFAULT_BAUD } else { baud_rate };
     let send_enq = config::send_enq();
 
     let handle = tokio::task::spawn_blocking(move || -> Result<ParsedResponse, PaxError> {
-        send_command_blocking(&path_owned, baud, &request, expected.as_deref(), timeout_ms, send_enq, &on_state, cancel)
+        send_command_blocking(&path_owned, baud, &request, expected.as_deref(), timeout_ms, send_enq, &on_state)
     });
 
     // A little slack over timeout_ms for the blocking-thread join overhead;
@@ -115,7 +111,6 @@ fn send_command_blocking(
     timeout_ms: u64,
     send_enq: bool,
     on_state: &Option<OnState>,
-    mut cancel: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 ) -> Result<ParsedResponse, PaxError> {
     protocol::fire_state(on_state, "SENDING");
 
@@ -144,18 +139,6 @@ fn send_command_blocking(
         if Instant::now() >= deadline {
             return Err(PaxError::new("TIMEOUT", format!("No complete response within {}ms", timeout_ms)));
         }
-        // Checked between read polls, so a cancel goes out on the port the
-        // transaction already holds.
-        if let Some(rx) = cancel.as_mut() {
-            if let Ok(frame) = rx.try_recv() {
-                cancel = None;
-                tracing::debug!("{}  cancel {} bytes RAW: {}", path, frame.len(), hex(&frame));
-                if let Err(e) = port.write_all(&frame) {
-                    tracing::warn!("{}  failed to write cancel: {}", path, e);
-                }
-                let _ = port.flush();
-            }
-        }
         match port.read(&mut chunk) {
             Ok(0) => { /* nothing this poll; keep going until deadline */ }
             Ok(n) => {
@@ -169,13 +152,6 @@ fn send_command_blocking(
                     let parsed = protocol::parse_response(&buf)?;
                     let got = parsed.fields.first().cloned().unwrap_or_default();
                     if let Some(exp) = expected {
-                        // The A15 that acknowledges a cancel can land ahead of
-                        // the transaction's own response.
-                        if got != exp && got == protocol::RESPONSE_CANCEL {
-                            let _ = port.write_all(&[protocol::ACK]);
-                            buf.clear();
-                            continue;
-                        }
                         if got != exp {
                             return Err(PaxError::new("UNEXPECTED_RESPONSE", format!("Expected {} response, got \"{}\"", exp, got))
                                 .with_raw(serde_json::Value::String(parsed.raw.clone())));
