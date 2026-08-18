@@ -266,6 +266,33 @@ async fn ping_terminal(State(state): State<AppState>, Path(id): Path<String>) ->
     }
 }
 
+/// Send the A14 that clears the terminal's own card prompt.
+///
+/// Returns the error when the terminal refused or was unreachable — the POS is
+/// already released either way, so a failure here changes only what the cashier
+/// is told to do at the device, never whether the cancel is reported.
+async fn cancel_on_device(terminal: &Terminal) -> Option<PaxError> {
+    match transport::cancel_on_terminal(terminal).await {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::warn!(
+                "[payment] A14 cancel failed on terminal \"{}\": {} {}",
+                terminal.name,
+                err.code,
+                err.message
+            );
+            Some(err)
+        }
+    }
+}
+
+fn device_json(err: Option<PaxError>) -> Value {
+    match err {
+        None => json!({ "sent": true }),
+        Some(e) => json!({ "sent": false, "code": e.code, "message": e.message }),
+    }
+}
+
 /// Abort whatever is in flight on this terminal, without needing a txnId.
 ///
 /// The POS learns a payment's txnId from the WebSocket, which can be blocked
@@ -280,8 +307,13 @@ async fn cancel_terminal(State(state): State<AppState>, Path(id): Path<String>) 
     };
 
     if transport::cancel(&terminal) {
-        tracing::warn!("[payment] cancel requested for terminal \"{}\" (no txnId)", terminal.name);
-        (StatusCode::OK, Json(json!({ "canceled": true, "terminalId": id })))
+        let device = cancel_on_device(&terminal).await;
+        tracing::warn!(
+            "[payment] cancel requested for terminal \"{}\" (no txnId) — device cancel {}",
+            terminal.name,
+            if device.is_none() { "sent" } else { "failed" }
+        );
+        (StatusCode::OK, Json(json!({ "canceled": true, "terminalId": id, "deviceCancel": device_json(device) })))
     } else {
         (
             StatusCode::CONFLICT,
@@ -930,8 +962,14 @@ async fn cancel_payment(State(state): State<AppState>, Path(id): Path<String>) -
     };
 
     if transport::cancel(&terminal) {
-        tracing::warn!("[payment] cancel requested — txnId={} terminal=\"{}\"", id, terminal.name);
-        (StatusCode::OK, Json(json!({ "canceled": true, "txnId": id })))
+        let device = cancel_on_device(&terminal).await;
+        tracing::warn!(
+            "[payment] cancel requested — txnId={} terminal=\"{}\" — device cancel {}",
+            id,
+            terminal.name,
+            if device.is_none() { "sent" } else { "failed" }
+        );
+        (StatusCode::OK, Json(json!({ "canceled": true, "txnId": id, "deviceCancel": device_json(device) })))
     } else {
         // Nothing on the wire: it already completed or was never sent. The
         // caller should re-read the transaction to see where it actually landed.

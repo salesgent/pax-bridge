@@ -68,11 +68,13 @@ fn cancels() -> &'static StdMutex<HashMap<String, CancellationToken>> {
 
 /// Stop waiting on the in-flight command for this terminal, if any.
 ///
-/// The terminal keeps its own card prompt until it times out or the red Cancel
-/// key is pressed, so this does NOT stop the customer from paying. The command
-/// therefore keeps running on its socket: whatever the terminal finally reports
-/// is handed to the `on_late` hook the caller passed to sale/refund/void, which
-/// is what lets an unwanted approval be voided instead of silently charged.
+/// This is the POS-side half of a cancel: it releases whoever is awaiting the
+/// terminal's reply. It does not touch the terminal — pair it with
+/// [`cancel_on_terminal`], which sends the A14 that actually clears the card
+/// prompt. The command keeps running on its socket either way, so whatever the
+/// terminal finally reports is handed to the `on_late` hook the caller passed
+/// to sale/refund/void, which is what lets an unwanted approval be voided
+/// instead of silently charged.
 /// Returns false if nothing was in flight.
 pub fn cancel(terminal: &Terminal) -> bool {
     let key = Target::from_terminal(terminal).key();
@@ -83,6 +85,35 @@ pub fn cancel(terminal: &Terminal) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Tell the terminal itself to abort what it is prompting for (A14 CANCEL).
+///
+/// Sent on its own connection, deliberately bypassing the per-terminal queue:
+/// the queue lock is held by the very command we are aborting, so waiting for
+/// it would deadlock until the sale timed out — the whole thing we are trying
+/// to avoid. The terminal answers A15 and drops back to idle, which also makes
+/// the pending T00 come back as a non-approval through the normal path.
+///
+/// Serial terminals cannot take a second command while one is on the wire (the
+/// port is held exclusively), so USB stays a device-side cancel.
+pub async fn cancel_on_terminal(terminal: &Terminal) -> Result<(), PaxError> {
+    let fields =
+        vec![Field::Single(protocol::COMMAND_CANCEL.to_string()), Field::Single(config::protocol_version())];
+    let request = protocol::build_message(&fields);
+    let expected = protocol::response_for(protocol::COMMAND_CANCEL).map(|s| s.to_string());
+
+    match Target::from_terminal(terminal) {
+        Target::Tcp { ip, port } => {
+            tcp::send_command(&ip, port, &request, expected.as_deref(), config::ping_timeout_ms(), None)
+                .await
+                .map(|_| ())
+        }
+        Target::Usb { .. } => Err(PaxError::new(
+            "CANCEL_UNSUPPORTED",
+            "This terminal is connected over USB, which allows only one command at a time. Press the red X key on the terminal to clear the prompt.",
+        )),
     }
 }
 

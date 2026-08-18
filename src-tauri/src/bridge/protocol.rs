@@ -36,6 +36,7 @@ pub const EOT: u8 = 0x04; // End of transmission
 pub const COMMAND_INITIALIZE: &str = "A00"; // Initialize / ping terminal   -> A01
 #[allow(dead_code)]
 pub const COMMAND_GET_INPUT: &str = "A08"; // Get input (optional)          -> A09
+pub const COMMAND_CANCEL: &str = "A14"; // Cancel the transaction on the terminal -> A15
 pub const COMMAND_DO_CREDIT: &str = "T00"; // DoCredit (sale/auth/return/void/postauth) -> T01
 pub const COMMAND_BATCH_CLOSE: &str = "B00"; // Batch close / settle        -> B01
 
@@ -44,6 +45,7 @@ pub fn response_for(command: &str) -> Option<&'static str> {
     match command {
         "A00" => Some("A01"),
         "A08" => Some("A09"),
+        "A14" => Some("A15"),
         "T00" => Some("T01"),
         "B00" => Some("B01"),
         _ => None,
