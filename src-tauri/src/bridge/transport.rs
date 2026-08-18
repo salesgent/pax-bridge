@@ -281,9 +281,9 @@ pub async fn sale(
     let sale_type = config::sale_txn_type();
     if sale_type != protocol::TXN_TYPE_SALE {
         tracing::warn!(
-            "[payment] sending sale as txn type \"{}\" (PAX_SALE_TXN_TYPE override) — \"{}\" is RETURN on a PAX, check the terminal screen",
+            "[payment] sending sale as txn type \"{}\" (PAX_SALE_TXN_TYPE override) — Sierra SALE is \"{}\", \"01\" is AUTH and needs the host",
             sale_type,
-            protocol::TXN_TYPE_RETURN
+            protocol::TXN_TYPE_SALE
         );
     }
     let fields = protocol::build_credit_fields(CreditFieldsInput {

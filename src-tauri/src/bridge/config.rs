@@ -129,11 +129,9 @@ pub fn protocol_version() -> String {
 
 /// DoCredit transaction type used for a sale.
 ///
-/// "01" is SALE and "02" is RETURN in every PAX implementation we could check,
-/// and a terminal that cannot reach its host will happily approve "02" offline
-/// while refusing "01" — which makes a refund look like a working sale. The
-/// override exists so the two can be compared on the terminal's own screen
-/// without a rebuild: set PAX_SALE_TXN_TYPE and read what the terminal says.
+/// Default is BroadPOS TSYS Sierra SALE ("02"). "01" is AUTH on this firmware
+/// and fails with COMM ERROR when the host is unreachable. Override only to
+/// compare on the terminal screen: set PAX_SALE_TXN_TYPE (e.g. 01).
 pub fn sale_txn_type() -> String {
     std::env::var("PAX_SALE_TXN_TYPE")
         .ok()

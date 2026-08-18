@@ -56,18 +56,18 @@ pub fn response_for(command: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Transaction type sub-codes for DoCredit (T00), field #3.
 // ---------------------------------------------------------------------------
-// These were off by one place for every type: SALE was sending "02", which is
-// RETURN — every "sale" reached the terminal as a refund (the screen reads
-// CREDIT RETURN) and every void went out as a post-auth.
-pub const TXN_TYPE_SALE: &str = "01"; // Sale / redeem
-pub const TXN_TYPE_RETURN: &str = "02"; // Return / refund
+// BroadPOS TSYS Sierra (this fleet) — NOT generic POSLink PDF numbering.
+// POSLink PDF says 01=SALE / 02=RETURN. Sending "01" here is AUTH: the
+// terminal must reach the host and comes back 100010 COMM ERROR / CONNECT
+// ERROR. "02" is what Sierra treats as SALE (card prompt + charge).
+// Keep A14 cancel on the live socket; do not "fix" these codes again.
 #[allow(dead_code)]
-pub const TXN_TYPE_AUTH: &str = "03"; // Pre-authorization
+pub const TXN_TYPE_AUTH: &str = "01"; // Pre-authorization (needs host)
+pub const TXN_TYPE_SALE: &str = "02"; // Sale / DoCredit
+pub const TXN_TYPE_RETURN: &str = "03"; // Return / refund
+pub const TXN_TYPE_VOID: &str = "04"; // Void a previous transaction
 #[allow(dead_code)]
-pub const TXN_TYPE_POSTAUTH: &str = "04"; // Post-authorization (capture)
-/// Voiding a sale by its original ref number. "16" is the generic VOID; "17"
-/// is the sale-specific one, which is what every void here reverses.
-pub const TXN_TYPE_VOID: &str = "17"; // V/SALE — void of a sale
+pub const TXN_TYPE_POSTAUTH: &str = "05"; // Post-authorization (capture)
 
 // ---------------------------------------------------------------------------
 // Result / EDC codes
