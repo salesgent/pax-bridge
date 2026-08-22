@@ -4,9 +4,11 @@
 pub mod config;
 pub mod db;
 pub mod http;
+pub mod printer;
 pub mod protocol;
 pub mod serial;
 pub mod server;
+pub mod system_printer;
 pub mod tcp;
 pub mod transport;
 pub mod ws;

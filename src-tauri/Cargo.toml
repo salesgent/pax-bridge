@@ -52,6 +52,18 @@ tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 bytes = { version = "1", default-features = false }
 anyhow = { version = "1", default-features = false }
+# Receipt payloads travel as base64 so a JSON body can carry raw ESC/POS.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+
+# Printing through the Windows spooler. Only the printing surface is pulled in,
+# so the size cost stays small.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Printing",
+    # OpenPrinterW is gated behind this: PRINTER_DEFAULTSW carries a DEVMODE.
+    "Win32_Graphics_Gdi",
+] }
 
 [profile.release]
 opt-level = "z"

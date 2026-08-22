@@ -2,6 +2,7 @@
 //! same paths, JSON shapes, status codes (402 decline, 504 timeout, 409 busy).
 
 use crate::bridge::db::{self, Terminal};
+use crate::bridge::printer::{self, PrintJob, PrintTarget};
 use crate::bridge::protocol::{CreditResponse, OnState, PaxError};
 use crate::bridge::transport;
 use crate::bridge::AppState;
@@ -68,6 +69,30 @@ fn error_map(code: &str) -> (StatusCode, &'static str) {
             StatusCode::INTERNAL_SERVER_ERROR,
             "Serial support (the \"serialport\" native module) is not installed. Run npm install in the server directory.",
         ),
+        // --- printing ---
+        "PRINTER_NOT_FOUND" => (
+            StatusCode::NOT_FOUND,
+            "No printer by that name on this computer. Check the name in the operating system's printer settings.",
+        ),
+        "PRINTER_UNREACHABLE" => (
+            StatusCode::BAD_GATEWAY,
+            "Could not reach the printer. Check it is powered on, and on the same network or plugged in.",
+        ),
+        "PRINTER_REFUSED" => (
+            StatusCode::BAD_GATEWAY,
+            "The printer's address answered but refused the connection — check its raw printing port (usually 9100) is enabled.",
+        ),
+        "PRINTER_WRITE_FAILED" => (
+            StatusCode::BAD_GATEWAY,
+            "The receipt could not be sent. The printer may be offline, paused, or out of paper.",
+        ),
+        "PRINTER_TIMEOUT" => (StatusCode::GATEWAY_TIMEOUT, "The printer did not accept the receipt in time."),
+        "PRINTER_UNAVAILABLE" => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "This computer's printing system could not be reached.",
+        ),
+        "PRINT_EMPTY" => (StatusCode::BAD_REQUEST, "There was nothing to print."),
+        "PRINT_BAD_PAYLOAD" => (StatusCode::BAD_REQUEST, "The receipt data was not valid base64."),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "Unexpected server error."),
     }
 }
@@ -1010,6 +1035,104 @@ async fn api_root() -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Printing
+//
+// The ERP builds the receipt and sends the finished ESC/POS bytes; the bridge
+// only carries them to a printer the browser cannot reach by itself.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrintRequest {
+    /// `transport` plus its fields — see PrintTarget.
+    #[serde(flatten)]
+    target: PrintTarget,
+    /// The receipt itself: base64-encoded ESC/POS.
+    #[serde(default)]
+    data: String,
+    #[serde(default)]
+    copies: Option<u16>,
+    #[serde(default)]
+    cut: bool,
+    #[serde(default)]
+    open_drawer: bool,
+    #[serde(default)]
+    drawer_pin: Option<u8>,
+    #[serde(default)]
+    drawer_pulse: Option<u32>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+impl PrintRequest {
+    fn into_job(self, data: Vec<u8>) -> (PrintTarget, PrintJob) {
+        let job = PrintJob {
+            data,
+            copies: self.copies.unwrap_or(1).clamp(1, 10),
+            cut: self.cut,
+            open_drawer: self.open_drawer,
+            drawer_pin: self.drawer_pin.unwrap_or(0),
+            drawer_pulse: self.drawer_pulse.unwrap_or(200),
+            ..PrintJob::default()
+        };
+        let job = PrintJob { timeout_ms: self.timeout_ms.unwrap_or(job.timeout_ms), ..job };
+        (self.target, job)
+    }
+}
+
+fn decode_payload(data: &str) -> Result<Vec<u8>, PaxError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|e| PaxError::new("PRINT_BAD_PAYLOAD", format!("Could not decode the receipt data: {}", e)))
+}
+
+async fn run_print(target: PrintTarget, job: PrintJob) -> (StatusCode, Json<Value>) {
+    match printer::print(&target, &job).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "target": outcome.target, "bytes": outcome.bytes })),
+        ),
+        Err(err) => pax_error_response(&err),
+    }
+}
+
+/// Everything this computer can print to.
+async fn list_printers() -> Json<Value> {
+    let found = printer::discover().await;
+    Json(json!({
+        "system": found.system,
+        "serial": found.serial,
+        "defaultNetworkPort": found.default_network_port,
+    }))
+}
+
+/// Print a receipt built elsewhere.
+async fn print_receipt(Json(body): Json<PrintRequest>) -> (StatusCode, Json<Value>) {
+    let data = match decode_payload(&body.data) {
+        Ok(data) => data,
+        Err(err) => return pax_error_response(&err),
+    };
+    let (target, job) = body.into_job(data);
+    run_print(target, job).await
+}
+
+/// Print the bridge's own test page, so a till can be proved before the ERP is
+/// wired up.
+async fn print_test(Json(body): Json<PrintRequest>) -> (StatusCode, Json<Value>) {
+    let (target, job) = body.into_job(printer::test_receipt());
+    run_print(target, PrintJob { cut: true, ..job }).await
+}
+
+/// Kick the cash drawer wired to a printer, without printing anything.
+async fn open_drawer(Json(body): Json<PrintRequest>) -> (StatusCode, Json<Value>) {
+    let pin = body.drawer_pin.unwrap_or(0);
+    let pulse = body.drawer_pulse.unwrap_or(200);
+    let (target, job) = body.into_job(printer::drawer_bytes(pin, pulse));
+    run_print(target, PrintJob { cut: false, open_drawer: false, ..job }).await
+}
+
+// ---------------------------------------------------------------------------
 // Router assembly
 // ---------------------------------------------------------------------------
 
@@ -1031,11 +1154,18 @@ pub fn router(state: AppState) -> Router {
         .route("/{id}", get(get_payment))
         .route("/{id}/cancel", post(cancel_payment));
 
+    let print_router = Router::new()
+        .route("/", post(print_receipt))
+        .route("/test", post(print_test))
+        .route("/drawer", post(open_drawer));
+
     Router::new()
+        .route("/api/printers", get(list_printers))
         .route("/api/health", get(health))
         .route("/api", get(api_root))
         .nest("/api/terminals", terminals_router)
         .nest("/api/payments", payments_router)
+        .nest("/api/print", print_router)
         .route("/ws", get(crate::bridge::ws::ws_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
