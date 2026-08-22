@@ -1,0 +1,40 @@
+# Compile checks on every platform the bridge ships to.
+#
+# The release workflow only builds on `pax-rust` and tags, which is too late to
+# learn that a platform-specific path does not compile — the Windows spooler
+# code cannot be built from a Mac at all, because `ring` will not
+# cross-compile. This runs `cargo check` on each platform instead, so that
+# feedback arrives on the branch.
+name: check
+
+on:
+  push:
+    branches-ignore:
+      - pax-rust # already covered by the release build
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Linux-only Tauri prerequisites are not needed for these two platforms.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Deliberately just a compile check. The crate has pre-existing clippy
+      # findings, so a lint gate would fail from the first run and teach
+      # everyone to ignore it.
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --all-targets
