@@ -749,7 +749,6 @@ paymentsRouter.post('/void', async (req, res) => {
       invoke: (ecrRefNum, onState) =>
         voidTransaction(terminal, orig.refNum, ecrRefNum, {
           amountCents: orig.amountCents,
-          origTransNum: orig.transactionNum,
           onState,
         }),
     },

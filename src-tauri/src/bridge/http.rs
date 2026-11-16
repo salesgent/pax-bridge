@@ -487,13 +487,11 @@ async fn record_late_result(
     );
 
     let void_ecr_ref_num = { state.db.lock().await.next_ecr_ref_num() };
-    let orig_trans_num = if result.transaction_num.is_empty() { None } else { Some(result.transaction_num.clone()) };
     let voided = transport::void_transaction(
         &terminal,
         result.ref_num.clone(),
         void_ecr_ref_num.clone(),
         result.approved_amount_cents,
-        orig_trans_num,
         None,
         None,
     )
@@ -869,7 +867,6 @@ async fn void_payment(State(state): State<AppState>, Json(body): Json<Value>) ->
     let orig_amount_cents = orig.get("amountCents").and_then(Value::as_i64).unwrap_or(0);
     let orig_order_ref = orig.get("orderRef").and_then(Value::as_str).map(|s| s.to_string());
     let orig_ref_num = orig.get("refNum").and_then(Value::as_str).unwrap_or("").to_string();
-    let orig_transaction_num = orig.get("transactionNum").and_then(Value::as_str).map(|s| s.to_string());
     let orig_id = orig.get("id").and_then(Value::as_str).unwrap_or("").to_string();
 
     let mut extra = Map::new();
@@ -878,7 +875,6 @@ async fn void_payment(State(state): State<AppState>, Json(body): Json<Value>) ->
 
     let terminal_for_invoke = terminal.clone();
     let orig_ref_for_invoke = orig_ref_num.clone();
-    let orig_trans_for_invoke = orig_transaction_num.clone();
     let invoke: Invoke = Box::new(move |ecr_ref_num, on_state, on_late| {
         Box::pin(async move {
             transport::void_transaction(
@@ -886,7 +882,6 @@ async fn void_payment(State(state): State<AppState>, Json(body): Json<Value>) ->
                 orig_ref_for_invoke,
                 ecr_ref_num,
                 orig_amount_cents,
-                orig_trans_for_invoke,
                 on_state,
                 on_late,
             )
