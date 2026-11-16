@@ -293,7 +293,6 @@ pub async fn sale(
         ecr_ref_num,
         cashier_id: String::new(),
         orig_ref_num: None,
-        orig_trans_num: None,
     });
     let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))
@@ -314,7 +313,6 @@ pub async fn refund(
         ecr_ref_num,
         cashier_id: String::new(),
         orig_ref_num: None,
-        orig_trans_num: None,
     });
     let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))
@@ -326,7 +324,6 @@ pub async fn void_transaction(
     orig_ref_num: String,
     ecr_ref_num: String,
     amount_cents: i64,
-    orig_trans_num: Option<String>,
     on_state: Option<OnState>,
     on_late: Option<LateCredit>,
 ) -> Result<CreditResponse, PaxError> {
@@ -337,7 +334,6 @@ pub async fn void_transaction(
         ecr_ref_num,
         cashier_id: String::new(),
         orig_ref_num: Some(orig_ref_num),
-        orig_trans_num,
     });
     let parsed = send_command(terminal, fields, config::payment_timeout_ms(), on_state, late_credit(on_late)).await?;
     Ok(protocol::parse_credit_response(&parsed))

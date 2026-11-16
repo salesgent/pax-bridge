@@ -117,8 +117,8 @@ export const AMOUNT_SUB = {
 export const TRACE_SUB = {
   ECR_REF_NUM: 0, // ECR reference number (our per-day sequence)
   INVOICE_NUM: 1, // invoice number (optional)
-  ORIG_REF_NUM: 2, // original ref num -- REQUIRED for VOID
-  ORIG_TRANS_NUM: 3, // original transaction number -- for VOID
+  AUTH_CODE: 2, // auth code (force/postauth only)
+  ORIG_REF_NUM: 3, // original terminal transaction number -- REQUIRED for VOID
 };
 
 // ---------------------------------------------------------------------------
@@ -153,23 +153,41 @@ export const HOST_SUB = {
 // Sub-field indexes inside the T01 AMOUNT information field.
 export const RES_AMOUNT_SUB = {
   APPROVED_AMOUNT: 0, // approved amount in CENTS
-  TIP_AMOUNT: 1,
+  AMOUNT_DUE: 1,
+  TIP_AMOUNT: 2,
 };
 
 // Sub-field indexes inside the T01 ACCOUNT information field.
 export const ACCOUNT_SUB = {
-  MASKED_PAN: 0, // e.g. "************1234"
-  EXP_DATE: 1,
-  CARD_TYPE: 2, // brand: VISA / MC / AMEX / DISC ...
-  ENTRY_MODE: 3, // chip / swipe / tap / manual
+  MASKED_PAN: 0, // last 4 digits, e.g. "6951"
+  ENTRY_MODE: 1, // see ENTRY_MODE_LABEL
+  EXP_DATE: 2, // MMYY -- never stored
+  CARD_TYPE: 6, // see CARD_TYPE_LABEL
+};
+
+export const CARD_TYPE_LABEL = {
+  '01': 'VISA',
+  '02': 'MASTERCARD',
+  '03': 'AMEX',
+  '04': 'DISCOVER',
+  '05': 'DINERS',
+  '07': 'JCB',
+};
+
+export const ENTRY_MODE_LABEL = {
+  0: 'MANUAL',
+  1: 'SWIPE',
+  2: 'CONTACTLESS',
+  3: 'SCANNER',
+  4: 'CHIP',
+  5: 'CHIP_FALLBACK_SWIPE',
 };
 
 // Sub-field indexes inside the T01 TRACE information field.
 export const RES_TRACE_SUB = {
-  ECR_REF_NUM: 0, // echoed ECR reference number
-  TRANSACTION_NUM: 1, // terminal transaction number (needed for VOID)
-  REF_NUM: 2, // host reference number
-  TIMESTAMP: 3, // terminal timestamp
+  TRANSACTION_NUM: 0, // terminal transaction number -- the original ref for VOID
+  ECR_REF_NUM: 1, // echoed ECR reference number
+  TIMESTAMP: 2, // terminal timestamp, YYYYMMDDhhmmss
 };
 
 // ---------------------------------------------------------------------------
@@ -952,18 +970,31 @@ export function parseCreditResponse(parsed) {
     approved: resultCode === RESULT_CODE.APPROVED,
     authCode: at(host, HOST_SUB.AUTH_CODE),
     hostRefNum: at(host, HOST_SUB.HOST_REF_NUM),
-    refNum: at(trace, RES_TRACE_SUB.REF_NUM),
+    refNum: at(trace, RES_TRACE_SUB.TRANSACTION_NUM),
     transactionNum: at(trace, RES_TRACE_SUB.TRANSACTION_NUM),
     ecrRefNum: at(trace, RES_TRACE_SUB.ECR_REF_NUM),
     maskedPAN: maskedPan, // full masked value
     last4: maskedPan ? maskedPan.replace(/[^0-9]/g, '').slice(-4) : '',
-    cardType: at(account, ACCOUNT_SUB.CARD_TYPE),
-    entryMode: at(account, ACCOUNT_SUB.ENTRY_MODE),
+    cardType: labelFor(CARD_TYPE_LABEL, at(account, ACCOUNT_SUB.CARD_TYPE)),
+    entryMode: labelFor(ENTRY_MODE_LABEL, at(account, ACCOUNT_SUB.ENTRY_MODE)),
     approvedAmountCents: toCents(at(amount, RES_AMOUNT_SUB.APPROVED_AMOUNT)),
     tipAmountCents: toCents(at(amount, RES_AMOUNT_SUB.TIP_AMOUNT)),
     timestamp: at(trace, RES_TRACE_SUB.TIMESTAMP),
-    raw: sanitizeRaw(fields, US), // keep everything for debugging
+    raw: redactExpiry(sanitizeRaw(fields, US)), // keep everything else for debugging
   };
+}
+
+function labelFor(labels, code) {
+  return labels[code] || code;
+}
+
+/** Blank the card expiry inside the raw ACCOUNT field before it is logged or stored. */
+function redactExpiry(raw) {
+  const account = raw[T01_RES_FIELD.ACCOUNT_INFO];
+  if (Array.isArray(account) && account[ACCOUNT_SUB.EXP_DATE]) {
+    account[ACCOUNT_SUB.EXP_DATE] = '';
+  }
+  return raw;
 }
 
 /** Parse a B01 (batch close) response. */
@@ -1009,15 +1040,15 @@ export async function initialize(terminal, { onState } = {}) {
  * Build the ordered T00 field array. Kept here (not in routes) so the field
  * order matches T00_REQ_FIELD in the constants module.
  */
-function buildCreditFields({ txnType, amountCents, tipCents = 0, ecrRefNum, cashierId = '', origRefNum, origTransNum }) {
+function buildCreditFields({ txnType, amountCents, tipCents = 0, ecrRefNum, cashierId = '', origRefNum }) {
   const amountInfo = [String(amountCents)];
   if (tipCents) amountInfo[1] = String(tipCents);
 
   const traceInfo = [String(ecrRefNum)];
   if (origRefNum !== undefined) {
-    traceInfo[1] = ''; // invoice
-    traceInfo[2] = String(origRefNum); // original ref num (VOID)
-    if (origTransNum !== undefined) traceInfo[3] = String(origTransNum);
+    traceInfo[TRACE_SUB.INVOICE_NUM] = '';
+    traceInfo[TRACE_SUB.AUTH_CODE] = '';
+    traceInfo[TRACE_SUB.ORIG_REF_NUM] = String(origRefNum);
   }
 
   return [
@@ -1075,7 +1106,7 @@ export function refund(terminal, amountCents, ecrRefNum, { cashierId = '', onSta
  * T00 VOID. Voids a previous transaction by its original ref number.
  * amountCents is optional (some hosts require it, some ignore it for voids).
  */
-export function voidTransaction(terminal, origRefNum, ecrRefNum, { amountCents = 0, origTransNum, cashierId = '', onState } = {}) {
+export function voidTransaction(terminal, origRefNum, ecrRefNum, { amountCents = 0, cashierId = '', onState } = {}) {
   return doCredit(
     terminal,
     buildCreditFields({
@@ -1084,7 +1115,6 @@ export function voidTransaction(terminal, origRefNum, ecrRefNum, { amountCents =
       ecrRefNum,
       cashierId,
       origRefNum,
-      origTransNum,
     }),
     { onState },
   );

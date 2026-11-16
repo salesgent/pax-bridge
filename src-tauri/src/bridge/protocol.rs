@@ -435,18 +435,57 @@ pub fn parse_credit_response(parsed: &ParsedResponse) -> CreditResponse {
         host_response_text: at(&host, 1),
         auth_code,
         host_ref_num: at(&host, 3),
-        ref_num: at(&trace, 2),
-        transaction_num: at(&trace, 1),
-        ecr_ref_num: at(&trace, 0),
+        // Trace: [transactionNum, ecrRefNum, timestamp, ...]
+        ref_num: at(&trace, 0),
+        transaction_num: at(&trace, 0),
+        ecr_ref_num: at(&trace, 1),
         masked_pan,
         last4,
-        card_type: at(&account, 2),
-        entry_mode: at(&account, 3),
+        // Account: [last4, entryMode, expiry MMYY, ..., cardType @6]
+        card_type: card_type_label(&at(&account, 6)),
+        entry_mode: entry_mode_label(&at(&account, 1)),
+        // Amount: [approved, amountDue, tip, ...]
         approved_amount_cents: to_cents(&at(&amount, 0)),
-        tip_amount_cents: to_cents(&at(&amount, 1)),
-        timestamp: at(&trace, 3),
-        raw: sanitize_raw(f),
+        tip_amount_cents: to_cents(&at(&amount, 2)),
+        timestamp: at(&trace, 2),
+        raw: redact_expiry(sanitize_raw(f)),
     }
+}
+
+fn card_type_label(code: &str) -> String {
+    let label = match code {
+        "01" => "VISA",
+        "02" => "MASTERCARD",
+        "03" => "AMEX",
+        "04" => "DISCOVER",
+        "05" => "DINERS",
+        "07" => "JCB",
+        other => other,
+    };
+    label.to_string()
+}
+
+fn entry_mode_label(code: &str) -> String {
+    let label = match code {
+        "0" => "MANUAL",
+        "1" => "SWIPE",
+        "2" => "CONTACTLESS",
+        "3" => "SCANNER",
+        "4" => "CHIP",
+        "5" => "CHIP_FALLBACK_SWIPE",
+        other => other,
+    };
+    label.to_string()
+}
+
+/// Blank the card expiry inside the raw ACCOUNT field before it is logged or stored.
+fn redact_expiry(mut raw: Value) -> Value {
+    if let Some(Value::Array(account)) = raw.get_mut(t01_res_field::ACCOUNT_INFO) {
+        if let Some(exp) = account.get_mut(2) {
+            *exp = Value::String(String::new());
+        }
+    }
+    raw
 }
 
 /// Parse a B01 (batch close) response.
@@ -477,8 +516,8 @@ pub struct CreditFieldsInput {
     pub tip_cents: i64,
     pub ecr_ref_num: String,
     pub cashier_id: String,
+    /// Original terminal transaction number (T01 trace[0]) for VOID.
     pub orig_ref_num: Option<String>,
-    pub orig_trans_num: Option<String>,
 }
 
 /// Build the ordered T00 field array. Field order matches T00_REQ_FIELD.
@@ -488,13 +527,10 @@ pub fn build_credit_fields(input: CreditFieldsInput) -> Vec<Field> {
         amount_info.push(input.tip_cents.to_string());
     }
 
+    // Trace: [ecrRefNum, invoice, authCode, origRefNum]
     let mut trace_info = vec![input.ecr_ref_num];
     if let Some(orig_ref) = input.orig_ref_num {
-        trace_info.push(String::new()); // invoice
-        trace_info.push(orig_ref); // original ref num (VOID)
-        if let Some(orig_trans) = input.orig_trans_num {
-            trace_info.push(orig_trans);
-        }
+        trace_info.extend([String::new(), String::new(), orig_ref]);
     }
 
     vec![
@@ -530,4 +566,55 @@ pub fn fields_for_log(fields: &[Field]) -> Value {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(parts: &[&str]) -> String {
+        parts.join(&(US as char).to_string())
+    }
+
+    // Real T01 from a BroadPOS TSYS Sierra terminal (COMM ERROR, Visa contactless).
+    #[test]
+    fn parses_broadpos_t01_fields() {
+        let fields = vec![
+            "T01".into(),
+            "1.54".into(),
+            "100010".into(),
+            "COMM ERROR".into(),
+            sub(&["", "CONNECT ERROR", "", "", "", "1", "", "", "", "", "", "", ""]),
+            "02".into(),
+            sub(&["0", "", "0", "0", "0", "0", "", "", "", "", "", "0", "0", "0"]),
+            sub(&["6951", "2", "1133", "", "", "", "01", " /", "", "", "0", "", "", "", "", "", "", ""]),
+            sub(&["", "202611160002", "20261116030642", "", "", "", "", ""]),
+        ];
+        let r = parse_credit_response(&ParsedResponse { fields, raw: String::new() });
+        assert_eq!(r.card_type, "VISA");
+        assert_eq!(r.entry_mode, "CONTACTLESS");
+        assert_eq!(r.last4, "6951");
+        assert_eq!(r.ecr_ref_num, "202611160002");
+        assert_eq!(r.transaction_num, "");
+        assert_eq!(r.ref_num, "");
+        assert_eq!(r.timestamp, "20261116030642");
+        assert_eq!(r.host_response_text, "CONNECT ERROR");
+        assert_eq!(r.raw[7][2], "", "expiry must be redacted");
+    }
+
+    #[test]
+    fn void_puts_original_ref_in_trace_slot_3() {
+        let fields = build_credit_fields(CreditFieldsInput {
+            txn_type: TXN_TYPE_VOID.into(),
+            amount_cents: 100,
+            tip_cents: 0,
+            ecr_ref_num: "202611160003".into(),
+            cashier_id: String::new(),
+            orig_ref_num: Some("42".into()),
+        });
+        match &fields[5] {
+            Field::Sub(v) => assert_eq!(v, &vec!["202611160003", "", "", "42"]),
+            _ => panic!("trace info must be sub-fields"),
+        }
+    }
 }
