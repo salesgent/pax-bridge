@@ -13,18 +13,54 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+fn default_vendor() -> String {
+    "pax".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Terminal {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_vendor")]
+    pub vendor: String, // "pax" | "valor" | "clover" | "dejavoo" | "nexo"
     pub model: String,
-    pub conn_type: String, // 'tcp' | 'usb'
+    pub conn_type: String, // "tcp" | "usb" | "snpd" | "rest" | "cloud" | "https"
     pub ip: String,
     pub port: u16,
     pub serial_path: String,
     pub baud_rate: u32,
+    #[serde(default)]
+    pub vendor_config: Map<String, Value>,
     pub created_at: String,
+}
+
+impl Terminal {
+    /// Effective normalized vendor key (empty/unknown defaults to "pax" for backwards compatibility).
+    pub fn effective_vendor(&self) -> &str {
+        match self.vendor.as_str() {
+            "valor" | "clover" | "dejavoo" | "nexo" | "pax" => self.vendor.as_str(),
+            _ => "pax",
+        }
+    }
+
+    pub fn config_str(&self, key: &str) -> String {
+        self.vendor_config
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn config_u16(&self, key: &str) -> Option<u16> {
+        json_number(self.vendor_config.get(key))
+            .map(|n| n as u16)
+            .filter(|&p| p > 0)
+    }
+
+    pub fn config_bool(&self, key: &str) -> bool {
+        self.vendor_config.get(key).and_then(Value::as_bool).unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -255,21 +291,36 @@ impl Db {
     pub fn create_terminal(&mut self, body: &Value) -> Terminal {
         let name = json_str_trim(body.get("name")).filter(|s| !s.is_empty()).unwrap_or_else(|| "Terminal".to_string());
         let model = body.get("model").and_then(Value::as_str).unwrap_or("A920 Pro").to_string();
-        let conn_type = if body.get("connType").and_then(Value::as_str) == Some("usb") { "usb" } else { "tcp" }.to_string();
+        let vendor = infer_vendor(body.get("vendor").and_then(Value::as_str), &model);
+        let default_conn = default_conn_type_for(&vendor);
+        let conn_type = body
+            .get("connType")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_conn.to_string());
         let ip = json_str_trim(body.get("ip")).unwrap_or_default();
-        let port = json_number(body.get("port")).map(|n| n as u16).filter(|&p| p != 0).unwrap_or(10009);
+        let default_port = default_port_for(&vendor, &conn_type);
+        let port = json_number(body.get("port")).map(|n| n as u16).filter(|&p| p != 0).unwrap_or(default_port);
         let serial_path = json_str_trim(body.get("serialPath")).unwrap_or_default();
         let baud_rate = json_number(body.get("baudRate")).map(|n| n as u32).filter(|&b| b != 0).unwrap_or(115_200);
+        let vendor_config = body
+            .get("vendorConfig")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
 
         let terminal = Terminal {
             id: Self::gen_id("term"),
             name,
+            vendor,
             model,
             conn_type,
             ip,
             port,
             serial_path,
             baud_rate,
+            vendor_config,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         self.data.terminals.push(terminal.clone());
@@ -289,8 +340,20 @@ impl Db {
                 t.model = s.to_string();
             }
         }
+        if let Some(v) = patch.get("vendor") {
+            if let Some(s) = v.as_str() {
+                t.vendor = infer_vendor(Some(s), &t.model);
+            }
+        } else if patch.get("model").is_some() {
+            t.vendor = infer_vendor(Some(&t.vendor), &t.model);
+        }
         if let Some(v) = patch.get("connType") {
-            t.conn_type = if v.as_str() == Some("usb") { "usb".to_string() } else { "tcp".to_string() };
+            if let Some(s) = v.as_str() {
+                let s = s.trim().to_ascii_lowercase();
+                if !s.is_empty() {
+                    t.conn_type = s;
+                }
+            }
         }
         if let Some(v) = patch.get("ip") {
             if let Some(s) = v.as_str() {
@@ -312,6 +375,24 @@ impl Db {
                 t.baud_rate = n as u32;
             }
         }
+        if let Some(obj) = patch.get("vendorConfig").and_then(Value::as_object) {
+            for (k, v) in obj {
+                if v.is_null() {
+                    t.vendor_config.remove(k);
+                } else {
+                    t.vendor_config.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let result = t.clone();
+        self.persist();
+        Some(result)
+    }
+
+    /// Persist a single vendorConfig key (e.g. Clover SNPD `authToken` after pairing).
+    pub fn set_vendor_config_key(&mut self, id: &str, key: &str, value: Value) -> Option<Terminal> {
+        let t = self.data.terminals.iter_mut().find(|t| t.id == id)?;
+        t.vendor_config.insert(key.to_string(), value);
         let result = t.clone();
         self.persist();
         Some(result)
@@ -441,5 +522,50 @@ impl Db {
         // A batch spans whatever days it settles.
         self.dirty_days.extend(touched);
         self.persist();
+    }
+}
+
+/// Infer vendor from an explicit vendor field or from the terminal model name.
+pub fn infer_vendor(explicit: Option<&str>, model: &str) -> String {
+    if let Some(v) = explicit {
+        let low = v.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "pax" | "valor" | "clover" | "dejavoo" | "nexo") {
+            return low;
+        }
+    }
+    let m = model.to_ascii_lowercase();
+    if m.starts_with("vp") || m.starts_with("vl") || m.contains("valor") || m.contains("sp880") {
+        return "valor".to_string();
+    }
+    if m.contains("clover") {
+        return "clover".to_string();
+    }
+    if m.contains("dejavoo") || matches!(m.as_str(), "z8" | "z9" | "z11" | "qd2" | "qd4" | "p1" | "p3" | "p8") {
+        return "dejavoo".to_string();
+    }
+    if m.contains("nexo") || m.contains("ingenico") || m.contains("verifone") || m.contains("adyen") || m.contains("worldline") {
+        return "nexo".to_string();
+    }
+    "pax".to_string()
+}
+
+pub fn default_conn_type_for(vendor: &str) -> &'static str {
+    match vendor {
+        "clover" => "snpd",
+        "dejavoo" => "cloud",
+        "nexo" => "https",
+        _ => "tcp",
+    }
+}
+
+pub fn default_port_for(vendor: &str, conn_type: &str) -> u16 {
+    match (vendor, conn_type) {
+        ("valor", "tcp") => 5000,
+        ("clover", "snpd") | ("clover", "tcp") => 12345,
+        ("clover", "rest") => 12346,
+        ("dejavoo", "tcp") => 8080,
+        ("nexo", "https") | ("nexo", "tcp") => 8443,
+        (_, "cloud") => 443,
+        _ => 10009,
     }
 }

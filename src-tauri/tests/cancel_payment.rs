@@ -61,12 +61,14 @@ fn terminal_on(port: u16) -> Terminal {
     Terminal {
         id: "t1".into(),
         name: "Fake".into(),
+        vendor: "pax".into(),
         model: "A35".into(),
         conn_type: "tcp".into(),
         ip: "127.0.0.1".into(),
         port,
         serial_path: String::new(),
         baud_rate: 9600,
+        vendor_config: Default::default(),
         created_at: String::new(),
     }
 }

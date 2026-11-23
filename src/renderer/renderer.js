@@ -63,6 +63,138 @@ const api = (path, opts) => fetch(`http://localhost:${state.port}/api${path}`, o
   return body;
 });
 
+const FALLBACK_DRIVERS = [
+  {
+    vendor: 'pax', label: 'PAX (BroadPOS / POSLink)',
+    models: ['A920 Pro', 'A35', 'A80', 'S300', 'E500', 'E700'],
+    defaultModel: 'A920 Pro', defaultConnType: 'tcp',
+    connTypes: [{ id: 'tcp', label: 'LAN (Wi-Fi / Ethernet)', defaultPort: 10009, requiresIp: true, requiresPort: true }, { id: 'usb', label: 'USB Serial', requiresSerial: true }],
+    capabilities: { pair: false }, fields: [], setupSteps: [],
+  },
+];
+
+let driversCatalog = FALLBACK_DRIVERS;
+let bridgeWs = null;
+
+function ensurePairingWs() {
+  if (bridgeWs && bridgeWs.readyState <= 1) return;
+  try {
+    bridgeWs = new WebSocket(`ws://localhost:${state.port}/ws`);
+    bridgeWs.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'PAIRING_CODE' && msg.pairingCode) {
+          $('pairingCodeDisplay').textContent = msg.pairingCode;
+          $('pairingBanner').hidden = false;
+        } else if (msg.type === 'PAIRED') {
+          $('pairingBanner').hidden = true;
+          loadTerminals();
+        }
+      } catch { /* ignore */ }
+    };
+    bridgeWs.onclose = () => { bridgeWs = null; };
+  } catch { /* ignore */ }
+}
+
+$('btnClosePairing')?.addEventListener('click', () => { $('pairingBanner').hidden = true; });
+
+function currentDriver() {
+  const v = $('termVendor')?.value || 'pax';
+  return driversCatalog.find((d) => d.vendor === v) || driversCatalog[0];
+}
+
+function syncTerminalForm() {
+  const drv = currentDriver();
+  if (!drv) return;
+  const modelSel = $('termModel');
+  const prevModel = modelSel.value;
+  modelSel.innerHTML = '';
+  for (const m of drv.models || []) {
+    const opt = document.createElement('option');
+    opt.value = m; opt.textContent = m;
+    modelSel.appendChild(opt);
+  }
+  modelSel.value = (drv.models || []).includes(prevModel) ? prevModel : (drv.defaultModel || drv.models?.[0] || '');
+
+  const connSel = $('termConnType');
+  const prevConn = connSel.value;
+  connSel.innerHTML = '';
+  for (const ct of drv.connTypes || []) {
+    const opt = document.createElement('option');
+    opt.value = ct.id; opt.textContent = ct.label;
+    connSel.appendChild(opt);
+  }
+  const validConn = (drv.connTypes || []).some((c) => c.id === prevConn) ? prevConn : (drv.defaultConnType || drv.connTypes?.[0]?.id || 'tcp');
+  connSel.value = validConn;
+
+  syncConnFields();
+}
+
+function syncConnFields() {
+  const drv = currentDriver();
+  const connId = $('termConnType').value;
+  const ct = (drv.connTypes || []).find((c) => c.id === connId) || {};
+  $('termLanRow').hidden = !ct.requiresIp;
+  $('termIp').required = Boolean(ct.requiresIp);
+  if (ct.defaultPort) $('termPort').value = ct.defaultPort;
+  $('termSerialRow').hidden = !ct.requiresSerial;
+  $('termSerial').required = Boolean(ct.requiresSerial);
+
+  const wrap = $('termVendorFields');
+  wrap.innerHTML = '';
+  for (const f of drv.fields || []) {
+    if (f.connTypes && !f.connTypes.includes(connId)) continue;
+    const lbl = document.createElement('label');
+    lbl.textContent = f.label;
+    const required = (f.requiredFor || []).includes(connId);
+    if (f.type === 'select') {
+      const sel = document.createElement('select');
+      sel.name = `vc_${f.key}`;
+      for (const o of f.options || []) {
+        const opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        sel.appendChild(opt);
+      }
+      if (f.default) sel.value = f.default;
+      lbl.appendChild(sel);
+    } else {
+      const inp = document.createElement('input');
+      inp.name = `vc_${f.key}`;
+      inp.type = f.type || 'text';
+      if (f.placeholder) inp.placeholder = f.placeholder;
+      if (f.default != null) inp.value = f.default;
+      inp.required = required;
+      lbl.appendChild(inp);
+    }
+    wrap.appendChild(lbl);
+  }
+
+  $('termSetupHint').textContent = (drv.setupSteps || []).join(' ');
+}
+
+$('termVendor')?.addEventListener('change', syncTerminalForm);
+$('termConnType')?.addEventListener('change', syncConnFields);
+
+async function loadDrivers() {
+  if (state.status !== 'running') return;
+  try {
+    const { drivers } = await api('/drivers');
+    if (Array.isArray(drivers) && drivers.length) {
+      driversCatalog = drivers;
+      const sel = $('termVendor');
+      const cur = sel.value;
+      sel.innerHTML = '';
+      for (const d of drivers) {
+        const opt = document.createElement('option');
+        opt.value = d.vendor; opt.textContent = d.label;
+        sel.appendChild(opt);
+      }
+      if (drivers.some((d) => d.vendor === cur)) sel.value = cur;
+      syncTerminalForm();
+    }
+  } catch { /* older bridge without /api/drivers */ }
+}
+
 async function loadTerminals() {
   const list = $('termList');
   if (state.status !== 'running') {
@@ -70,6 +202,8 @@ async function loadTerminals() {
     $('glanceTerminals').textContent = '—';
     return;
   }
+  ensurePairingWs();
+  if (driversCatalog === FALLBACK_DRIVERS) await loadDrivers();
   try {
     const { terminals } = await api('/terminals');
     $('glanceTerminals').textContent = terminals.length;
@@ -85,15 +219,39 @@ async function loadTerminals() {
 function termRow(t) {
   const el = document.createElement('div');
   el.className = 'term';
+  const vendor = (t.vendor || 'pax').toUpperCase();
+  const target = t.connType === 'usb'
+    ? `USB ${t.serialPath || ''}`
+    : t.connType === 'cloud'
+      ? `Cloud (${t.vendorConfig?.epi || t.vendorConfig?.deviceId || t.vendorConfig?.tpn || t.vendorConfig?.poiId || 'API'})`
+      : `${t.ip || 'LAN'}:${t.port || ''}`;
+  const showPair = t.vendor === 'clover' && (t.connType === 'snpd' || t.connType === 'tcp');
+  const pairedBadge = showPair && t.vendorConfig?.authToken ? ' · paired' : '';
   el.innerHTML = `
     <div>
       <div><b>${escapeHtml(t.name)}</b> <span class="badge" data-badge>?</span></div>
-      <small>${escapeHtml(t.model || '')} · ${escapeHtml(t.ip || 'LAN')}:${t.port || ''}</small>
+      <small>${escapeHtml(vendor)} · ${escapeHtml(t.model || '')} · ${escapeHtml(target)}${escapeHtml(pairedBadge)}</small>
     </div>
     <div class="term-actions">
+      ${showPair ? '<button class="btn sm" data-pair>Pair</button>' : ''}
       <button class="btn sm" data-test>Test</button>
       <button class="btn sm ghost" data-del>Delete</button>
     </div>`;
+  const pairBtn = el.querySelector('[data-pair]');
+  if (pairBtn) {
+    pairBtn.addEventListener('click', async (ev) => {
+      const badge = el.querySelector('[data-badge]');
+      ev.target.disabled = true; badge.textContent = 'pairing…'; badge.className = 'badge';
+      try {
+        await api(`/terminals/${t.id}/pair`, { method: 'POST' });
+        badge.textContent = 'paired'; badge.className = 'badge on';
+        $('pairingBanner').hidden = true;
+        loadTerminals();
+      } catch (e) {
+        badge.textContent = 'pair failed'; badge.className = 'badge off'; badge.title = e.message;
+      } finally { ev.target.disabled = false; }
+    });
+  }
   el.querySelector('[data-test]').addEventListener('click', async (ev) => {
     const badge = el.querySelector('[data-badge]');
     ev.target.disabled = true; badge.textContent = '…'; badge.className = 'badge';
@@ -117,23 +275,38 @@ $('termForm').addEventListener('submit', async (e) => {
   const msg = $('termMsg');
   msg.textContent = ''; msg.className = 'form-msg';
   const fd = Object.fromEntries(new FormData(e.target).entries());
+  const vendorConfig = {};
+  for (const [k, v] of Object.entries(fd)) {
+    if (k.startsWith('vc_') && String(v).trim() !== '') {
+      const key = k.slice(3);
+      vendorConfig[key] = key.toLowerCase().includes('port') ? Number(v) : String(v).trim();
+    }
+  }
   try {
     await api('/terminals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: fd.name, model: fd.model, connType: 'tcp',
-        ip: fd.ip, port: Number(fd.port) || 10009,
+        name: fd.name,
+        vendor: fd.vendor || 'pax',
+        model: fd.model,
+        connType: fd.connType || 'tcp',
+        ip: fd.ip || '',
+        port: Number(fd.port) || 0,
+        serialPath: fd.serialPath || '',
+        baudRate: Number(fd.baudRate) || 115200,
+        vendorConfig,
       }),
     });
     msg.textContent = 'Saved.'; msg.className = 'form-msg ok';
     e.target.reset();
+    syncTerminalForm();
     loadTerminals();
   } catch (err) {
     msg.textContent = err.message; msg.className = 'form-msg err';
   }
 });
-$('btnClearForm').addEventListener('click', () => $('termForm').reset());
+$('btnClearForm').addEventListener('click', () => { $('termForm').reset(); syncTerminalForm(); });
 $('btnReloadTerms').addEventListener('click', loadTerminals);
 
 // ---- settings -------------------------------------------------------------

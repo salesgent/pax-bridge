@@ -1,0 +1,237 @@
+name: Staging Build & Release (Tauri)
+
+# Dedicated workflow for the `staging` branch only.
+# Production `release-tauri.yml` (on `pax-rust` + `v*` tags) is untouched.
+#
+# 1. Runs the full Rust unit + mock-terminal integration test suite on macOS & Windows.
+# 2. Builds signed/notarized macOS (arm64 + x64) and Windows (x64 NSIS) installers.
+# 3. Publishes to a dedicated `staging` GitHub Prerelease (never overwrites `latest`).
+on:
+  push:
+    branches:
+      - staging
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload installers to the staging GitHub prerelease"
+        type: boolean
+        default: true
+
+concurrency:
+  group: staging-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Rust Tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Run unit and mock-terminal integration tests
+        working-directory: src-tauri
+        run: |
+          cargo test --all-targets -- --nocapture
+          cargo check --features bridge-server
+
+  build:
+    name: Build (${{ matrix.label }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            platform: macos-latest
+            args: --target aarch64-apple-darwin --bundles dmg
+            rust_target: aarch64-apple-darwin
+            artifact_name: staging-mac-arm64
+          - label: macOS Intel
+            platform: macos-latest
+            args: --target x86_64-apple-darwin --bundles dmg
+            rust_target: x86_64-apple-darwin
+            artifact_name: staging-mac-x64
+          - label: Windows x64
+            platform: windows-latest
+            args: --bundles nsis
+            rust_target: ""
+            artifact_name: staging-win-x64
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Configure Apple signing + notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_API_KEY_SECRET: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD || secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_API_KEY_SECRET:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ]; then
+            KEY_DIR="${RUNNER_TEMP}/private_keys"
+            mkdir -p "$KEY_DIR"
+            KEY_PATH="${KEY_DIR}/AuthKey_${APPLE_API_KEY_ID}.p8"
+            case "$APPLE_API_KEY_SECRET" in
+              *BEGIN*PRIVATE\ KEY*)
+                printf '%s\n' "$APPLE_API_KEY_SECRET" > "$KEY_PATH"
+                ;;
+              *)
+                if ! printf '%s' "$APPLE_API_KEY_SECRET" | base64 --decode > "$KEY_PATH" 2>/dev/null; then
+                  printf '%s\n' "$APPLE_API_KEY_SECRET" > "$KEY_PATH"
+                fi
+                ;;
+            esac
+            chmod 600 "$KEY_PATH"
+            {
+              echo "APPLE_API_KEY=${APPLE_API_KEY_ID}"
+              echo "APPLE_API_ISSUER=${APPLE_API_ISSUER}"
+              echo "APPLE_API_KEY_PATH=${KEY_PATH}"
+            } >> "$GITHUB_ENV"
+            echo "Notarization auth: App Store Connect API key (${APPLE_API_KEY_ID})"
+          elif [ -n "${APPLE_ID_SECRET:-}" ] && [ -n "${APPLE_PASSWORD_SECRET:-}" ] && [ -n "${APPLE_TEAM_ID_SECRET:-}" ]; then
+            {
+              echo "APPLE_ID=${APPLE_ID_SECRET}"
+              echo "APPLE_PASSWORD=${APPLE_PASSWORD_SECRET}"
+              echo "APPLE_TEAM_ID=${APPLE_TEAM_ID_SECRET}"
+            } >> "$GITHUB_ENV"
+            echo "Notarization auth: Apple ID + team ${APPLE_TEAM_ID_SECRET}"
+          else
+            echo "No Apple notarization secrets found — continuing with local/unsigned staging build."
+          fi
+
+      - name: Build Tauri staging installer
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE || secrets.CSC_LINK }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD || secrets.CSC_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        with:
+          projectPath: .
+          args: ${{ matrix.args }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-staging:
+    name: Publish Staging Prerelease
+    needs: build
+    if: github.event_name == 'push' || inputs.publish == true
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      TAG: staging
+      MAC_ARM: Salesgent-Pax-Bridge-Staging-macOS-Apple-Silicon.dmg
+      MAC_INTEL: Salesgent-Pax-Bridge-Staging-macOS-Intel.dmg
+      WINDOWS: Salesgent-Pax-Bridge-Staging-Windows-Setup.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage renamed installers
+        run: |
+          set -euo pipefail
+          mkdir -p dist-staging
+          ARM_FILE=$(find artifacts/staging-mac-arm64 -name '*.dmg' | head -1)
+          X64_FILE=$(find artifacts/staging-mac-x64 -name '*.dmg' | head -1)
+          WIN_FILE=$(find artifacts/staging-win-x64 -name '*-setup.exe' | head -1)
+
+          cp "$ARM_FILE" "dist-staging/$MAC_ARM"
+          cp "$X64_FILE" "dist-staging/$MAC_INTEL"
+          cp "$WIN_FILE" "dist-staging/$WINDOWS"
+          ls -lh dist-staging/
+
+      - name: Create or update staging prerelease
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+
+          cat > staging-notes.md <<EOF
+          ## Salesgent Hardware Bridge — Staging Build (\`$SHORT_SHA\`)
+
+          > **Staging prerelease** built from branch \`staging\`. Production releases on \`pax-rust\` are unaffected.
+
+          ### Supported Terminals
+          - **PAX** (A920 Pro, A35, A80, S300, E500, E700) — LAN TCP & USB
+          - **Valor PayTech** (VP100, VL100, VL110, VP300, VP500, VL500, VL550) — Local TCP (:5000 / :5001 cancel), USB, & Valor Connect Cloud
+          - **Clover** (Clover Flex, Mini, Compact, Station) — Secure Network Pay Display (WSS :12345) & REST Pay Display (:12346 / Cloud)
+          - **Dejavoo SPIn** (Z8, Z9, Z11, QD2, QD4, P1, P3, P8) — SPIn v2 REST (Cloud & Local)
+          - **NEXO Retailer / ISO 20022** (Ingenico, Verifone, Adyen, Worldline) — Local TCP/HTTPS
+
+          | Computer | Download |
+          |---|---|
+          | **Mac — Apple Silicon** (M1/M2/M3/M4) | [$MAC_ARM]($BASE/$MAC_ARM) |
+          | **Mac — Intel** | [$MAC_INTEL]($BASE/$MAC_INTEL) |
+          | **Windows** (64-bit) | [$WINDOWS]($BASE/$WINDOWS) |
+          EOF
+
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG" --force
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" \
+              --title "Salesgent Hardware Bridge (Staging)" \
+              --notes-file staging-notes.md \
+              --prerelease
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "Salesgent Hardware Bridge (Staging)" \
+              --notes-file staging-notes.md \
+              --prerelease
+          fi
+
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            "dist-staging/$MAC_ARM" \
+            "dist-staging/$MAC_INTEL" \
+            "dist-staging/$WINDOWS"

@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod db;
+pub mod drivers;
 pub mod http;
 pub mod protocol;
 pub mod serial;
