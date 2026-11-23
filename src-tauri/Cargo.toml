@@ -36,11 +36,15 @@ tauri-plugin-autostart = "2"
 # In-app updates. rustls (not native-tls) keeps the size cost down.
 tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls"] }
 
-# --- PAX bridge ---
+# --- Hardware bridge (PAX, Valor, Clover, Dejavoo, NEXO) ---
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "signal"] }
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 serialport = { version = "4", default-features = false }

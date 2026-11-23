@@ -11,11 +11,13 @@
 
 use crate::bridge::config;
 use crate::bridge::db::Terminal;
+use crate::bridge::drivers;
 use crate::bridge::protocol::{self, BatchResponse, CreditFieldsInput, CreditResponse, Field, InitializeInfo, OnState, PaxError};
 use crate::bridge::serial::{self, SerialPortInfo};
 use crate::bridge::tcp;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
@@ -88,7 +90,7 @@ fn cancel_frames() -> &'static StdMutex<HashMap<String, tokio::sync::mpsc::Sende
 /// instead of silently charged.
 /// Returns false if nothing was in flight.
 pub fn cancel(terminal: &Terminal) -> bool {
-    let key = Target::from_terminal(terminal).key();
+    let key = drivers::queue_key(terminal);
     let guard = cancels().lock().unwrap();
     match guard.get(&key) {
         Some(token) => {
@@ -99,18 +101,23 @@ pub fn cancel(terminal: &Terminal) -> bool {
     }
 }
 
-/// Tell the terminal itself to abort what it is prompting for (A14 CANCEL).
-///
-/// Sent on its own connection, deliberately bypassing the per-terminal queue:
-/// the queue lock is held by the very command we are aborting, so waiting for
-/// it would deadlock until the sale timed out — the whole thing we are trying
-/// to avoid. The terminal answers A15 and drops back to idle, which also makes
-/// the pending T00 come back as a non-approval through the normal path.
-///
-/// Serial terminals cannot take a second command while one is on the wire (the
-/// port is held exclusively), so USB stays a device-side cancel.
+/// Tell the terminal itself to abort what it is prompting for.
+/// Dispatches per vendor: PAX A14, Valor port 5001 TRAN_MODE=99, Clover BREAK / REST reset, NEXO Abort.
 pub async fn cancel_on_terminal(terminal: &Terminal) -> Result<(), PaxError> {
-    let key = Target::from_terminal(terminal).key();
+    match terminal.effective_vendor() {
+        "valor" => return drivers::valor::cancel_on_terminal(terminal).await,
+        "clover" => return drivers::clover::cancel_on_terminal(terminal).await,
+        "nexo" => return drivers::nexo::cancel_on_terminal(terminal).await,
+        "dejavoo" => {
+            return Err(PaxError::new(
+                "CANCEL_UNSUPPORTED",
+                "Dejavoo SPIn does not support remote cancel — press the red Cancel key on the terminal.",
+            ));
+        }
+        _ => {}
+    }
+
+    let key = drivers::queue_key(terminal);
     let sender = { cancel_frames().lock().unwrap().get(&key).cloned() };
     let sender = sender.ok_or_else(|| {
         PaxError::new("NOT_IN_FLIGHT", "No command is on the wire for this terminal to cancel.")
@@ -149,7 +156,7 @@ fn queue_for(key: &str) -> Arc<TerminalQueue> {
 
 /// True if a command is already in flight/queued for this terminal.
 pub fn is_busy(terminal: &Terminal) -> bool {
-    let key = Target::from_terminal(terminal).key();
+    let key = drivers::queue_key(terminal);
     let guard = queues().lock().unwrap();
     guard.get(&key).map(|q| q.pending.load(Ordering::SeqCst) > 0).unwrap_or(false)
 }
@@ -259,8 +266,75 @@ fn late_credit(on_late: Option<LateCredit>) -> Option<LateRaw> {
     })
 }
 
-/// A00 initialize / ping. Returns terminal info + latencyMs.
+/// Run a non-PAX vendor payment operation under the same per-terminal serialized
+/// queue, immediate POS cancel token, and late-result auto-void safety guarantee.
+async fn run_serialized_credit<F, Fut>(
+    terminal: &Terminal,
+    on_late: Option<LateCredit>,
+    work: F,
+) -> Result<CreditResponse, PaxError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<CreditResponse, PaxError>> + Send + 'static,
+{
+    let key = drivers::queue_key(terminal);
+    let q = queue_for(&key);
+
+    q.pending.fetch_add(1, Ordering::SeqCst);
+    let pending_guard = PendingGuard(q.clone());
+    let lock = q.lock.clone().lock_owned().await;
+
+    let token = CancellationToken::new();
+    cancels().lock().unwrap().insert(key.clone(), token.clone());
+    let cancel_guard = CancelGuard(key);
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _pending_guard = pending_guard;
+        let _lock = lock;
+        let _cancel_guard = cancel_guard;
+        let result = work().await;
+        let _ = tx.send(result);
+    });
+
+    tokio::select! {
+        received = &mut rx => {
+            return received.unwrap_or_else(|_| Err(PaxError::new("SOCKET_ERROR", "Terminal command ended without a result")));
+        }
+        _ = token.cancelled() => {}
+    }
+
+    if let Some(handler) = on_late {
+        tokio::spawn(async move {
+            if let Ok(result) = rx.await {
+                handler(result);
+            }
+        });
+    }
+
+    Err(PaxError::new("CANCELED", "Cancelled from the point of sale."))
+}
+
+/// Interactive terminal pairing (Clover SNPD). Returns `(authToken, discoveryInfo)`.
+pub async fn pair(
+    terminal: &Terminal,
+    on_pairing_code: Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<(String, Value), PaxError> {
+    match terminal.effective_vendor() {
+        "clover" => drivers::clover::pair(terminal, on_pairing_code).await,
+        _ => Err(PaxError::new("UNSUPPORTED", "This terminal type does not require interactive pairing.")),
+    }
+}
+
+/// Initialize / ping terminal. Dispatches to the configured vendor driver.
 pub async fn initialize(terminal: &Terminal, on_state: Option<OnState>) -> Result<InitializeInfo, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => return drivers::valor::initialize(terminal).await,
+        "clover" => return drivers::clover::initialize(terminal).await,
+        "dejavoo" => return drivers::dejavoo::initialize(terminal).await,
+        "nexo" => return drivers::nexo::initialize(terminal).await,
+        _ => {}
+    }
     let started = Instant::now();
     let fields = vec![Field::Single(protocol::COMMAND_INITIALIZE.to_string()), Field::Single(config::protocol_version())];
     let parsed = send_command(terminal, fields, config::ping_timeout_ms(), on_state, None).await?;
@@ -269,7 +343,7 @@ pub async fn initialize(terminal: &Terminal, on_state: Option<OnState>) -> Resul
     Ok(info)
 }
 
-/// T00 SALE. amountCents/tipCents are integer cents.
+/// SALE. amountCents/tipCents are integer cents.
 pub async fn sale(
     terminal: &Terminal,
     amount_cents: i64,
@@ -278,6 +352,38 @@ pub async fn sale(
     on_state: Option<OnState>,
     on_late: Option<LateCredit>,
 ) -> Result<CreditResponse, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::valor::sale(&t, amount_cents, ecr_ref_num, tip_cents, on_state).await
+            })
+            .await;
+        }
+        "clover" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::clover::sale(&t, amount_cents, ecr_ref_num, tip_cents, on_state).await
+            })
+            .await;
+        }
+        "dejavoo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::dejavoo::sale(&t, amount_cents, ecr_ref_num, tip_cents, on_state).await
+            })
+            .await;
+        }
+        "nexo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::nexo::sale(&t, amount_cents, ecr_ref_num, tip_cents, on_state).await
+            })
+            .await;
+        }
+        _ => {}
+    }
+
     let sale_type = config::sale_txn_type();
     if sale_type != protocol::TXN_TYPE_SALE {
         tracing::warn!(
@@ -298,7 +404,7 @@ pub async fn sale(
     Ok(protocol::parse_credit_response(&parsed))
 }
 
-/// T00 RETURN / refund.
+/// RETURN / refund.
 pub async fn refund(
     terminal: &Terminal,
     amount_cents: i64,
@@ -306,6 +412,38 @@ pub async fn refund(
     on_state: Option<OnState>,
     on_late: Option<LateCredit>,
 ) -> Result<CreditResponse, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::valor::refund(&t, amount_cents, ecr_ref_num, on_state).await
+            })
+            .await;
+        }
+        "clover" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::clover::refund(&t, amount_cents, ecr_ref_num, on_state).await
+            })
+            .await;
+        }
+        "dejavoo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::dejavoo::refund(&t, amount_cents, ecr_ref_num, on_state).await
+            })
+            .await;
+        }
+        "nexo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::nexo::refund(&t, amount_cents, ecr_ref_num, on_state).await
+            })
+            .await;
+        }
+        _ => {}
+    }
+
     let fields = protocol::build_credit_fields(CreditFieldsInput {
         txn_type: protocol::TXN_TYPE_RETURN.to_string(),
         amount_cents,
@@ -318,7 +456,7 @@ pub async fn refund(
     Ok(protocol::parse_credit_response(&parsed))
 }
 
-/// T00 VOID. Voids a previous transaction by its original ref number.
+/// VOID. Voids a previous transaction by its original ref number.
 pub async fn void_transaction(
     terminal: &Terminal,
     orig_ref_num: String,
@@ -327,6 +465,38 @@ pub async fn void_transaction(
     on_state: Option<OnState>,
     on_late: Option<LateCredit>,
 ) -> Result<CreditResponse, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::valor::void_transaction(&t, orig_ref_num, ecr_ref_num, amount_cents, on_state).await
+            })
+            .await;
+        }
+        "clover" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::clover::void_transaction(&t, orig_ref_num, ecr_ref_num, amount_cents, on_state).await
+            })
+            .await;
+        }
+        "dejavoo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::dejavoo::void_transaction(&t, orig_ref_num, ecr_ref_num, amount_cents, on_state).await
+            })
+            .await;
+        }
+        "nexo" => {
+            let t = terminal.clone();
+            return run_serialized_credit(terminal, on_late, move || async move {
+                drivers::nexo::void_transaction(&t, orig_ref_num, ecr_ref_num, amount_cents, on_state).await
+            })
+            .await;
+        }
+        _ => {}
+    }
+
     let fields = protocol::build_credit_fields(CreditFieldsInput {
         txn_type: protocol::TXN_TYPE_VOID.to_string(),
         amount_cents,
@@ -339,8 +509,16 @@ pub async fn void_transaction(
     Ok(protocol::parse_credit_response(&parsed))
 }
 
-/// B00 batch close / settle.
+/// Batch close / settle.
 pub async fn batch_close(terminal: &Terminal) -> Result<BatchResponse, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => return drivers::valor::batch_close(terminal).await,
+        "clover" => return drivers::clover::batch_close(terminal).await,
+        "dejavoo" => return drivers::dejavoo::batch_close(terminal).await,
+        "nexo" => return drivers::nexo::batch_close(terminal).await,
+        _ => {}
+    }
+
     let fields = vec![
         Field::Single(protocol::COMMAND_BATCH_CLOSE.to_string()),
         Field::Single(config::protocol_version()),
@@ -350,9 +528,15 @@ pub async fn batch_close(terminal: &Terminal) -> Result<BatchResponse, PaxError>
     Ok(protocol::parse_batch_response(&parsed))
 }
 
-/// Lightweight LAN/USB diagnostics without sending a full payment. Helps
-/// distinguish "device offline" vs "BroadPOS ECR not listening".
+/// Lightweight diagnostics without sending a full payment.
 pub async fn diagnose(terminal: &Terminal) -> Result<Value, PaxError> {
+    match terminal.effective_vendor() {
+        "valor" => return drivers::valor::diagnose(terminal).await,
+        "clover" => return drivers::clover::diagnose(terminal).await,
+        "dejavoo" => return drivers::dejavoo::diagnose(terminal).await,
+        "nexo" => return drivers::nexo::diagnose(terminal).await,
+        _ => {}
+    }
     let protocol_version = config::protocol_version();
 
     if terminal.conn_type == "usb" {

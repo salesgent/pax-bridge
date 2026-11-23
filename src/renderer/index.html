@@ -59,7 +59,7 @@
         <section class="panel active" data-panel="status">
           <div class="page-head">
             <h2>Status</h2>
-            <p class="muted">The bridge runs on this computer and talks to your PAX terminal over the LAN. Keep the app running while taking payments.</p>
+            <p class="muted">The bridge runs on this computer and connects your POS to PAX, Valor, Clover, Dejavoo, and NEXO payment terminals. Keep the app running while taking payments.</p>
           </div>
 
           <div class="card hero">
@@ -107,7 +107,16 @@
         <section class="panel" data-panel="terminals">
           <div class="page-head">
             <h2>Terminals</h2>
-            <p class="muted">Register each PAX card reader on your network. Use “Test” to confirm the bridge can reach it.</p>
+            <p class="muted">Register PAX, Valor VP100, Clover Flex, Dejavoo, or NEXO terminals. Use “Diagnose”, “Pair”, and “Test” to verify before taking payments.</p>
+          </div>
+
+          <div id="pairingBanner" class="card" hidden style="margin-bottom: 14px; border-color: #6d5efc;">
+            <div class="card-head">
+              <h3>Clover pairing code</h3>
+              <button class="btn ghost sm" id="btnClosePairing" type="button">Dismiss</button>
+            </div>
+            <p class="muted">Enter this 4-digit code on the Clover Flex screen to finish pairing:</p>
+            <div id="pairingCodeDisplay" class="mono" style="font-size: 28px; font-weight: 800; letter-spacing: 6px; margin-top: 8px;">—</div>
           </div>
 
           <div class="grid">
@@ -115,21 +124,43 @@
               <div class="card-head"><h3>Add a terminal</h3></div>
               <form id="termForm" class="form">
                 <label>Name<input name="name" placeholder="Front Counter" required /></label>
-                <label>Model
-                  <select name="model">
-                    <option>A920 Pro</option>
-                    <option>A35</option>
+                <div class="row gap">
+                  <label class="grow">Vendor
+                    <select name="vendor" id="termVendor">
+                      <option value="pax">PAX (BroadPOS / POSLink)</option>
+                      <option value="valor">Valor PayTech (VP100 / VL-Series)</option>
+                      <option value="clover">Clover (Flex / Mini / Station)</option>
+                      <option value="dejavoo">Dejavoo (SPIn v2)</option>
+                      <option value="nexo">NEXO Retailer (ISO 20022)</option>
+                    </select>
+                  </label>
+                  <label class="grow">Model
+                    <select name="model" id="termModel">
+                      <option>A920 Pro</option>
+                      <option>A35</option>
+                    </select>
+                  </label>
+                </div>
+                <label>Connection mode
+                  <select name="connType" id="termConnType">
+                    <option value="tcp">LAN (Wi-Fi / Ethernet)</option>
                   </select>
                 </label>
-                <div class="row gap">
-                  <label class="grow">Terminal IP<input name="ip" placeholder="192.168.1.50" required /></label>
-                  <label style="width:112px">Port<input name="port" type="number" value="10009" /></label>
+                <div class="row gap" id="termLanRow">
+                  <label class="grow">Terminal IP<input name="ip" id="termIp" placeholder="192.168.1.50" /></label>
+                  <label style="width:112px">Port<input name="port" id="termPort" type="number" value="10009" /></label>
                 </div>
+                <div class="row gap" id="termSerialRow" hidden>
+                  <label class="grow">Serial port<input name="serialPath" id="termSerial" placeholder="/dev/tty.usbmodem…" /></label>
+                  <label style="width:112px">Baud<input name="baudRate" type="number" value="115200" /></label>
+                </div>
+                <div id="termVendorFields"></div>
                 <div class="row gap form-foot">
                   <button class="btn primary" type="submit">Save terminal</button>
                   <button class="btn ghost" type="button" id="btnClearForm">Clear</button>
                 </div>
                 <div class="form-msg" id="termMsg"></div>
+                <div id="termSetupHint" class="muted" style="font-size: 12px; margin-top: 8px;"></div>
               </form>
             </div>
 

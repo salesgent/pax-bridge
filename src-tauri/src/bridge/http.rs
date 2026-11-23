@@ -2,6 +2,7 @@
 //! same paths, JSON shapes, status codes (402 decline, 504 timeout, 409 busy).
 
 use crate::bridge::db::{self, Terminal};
+use crate::bridge::drivers;
 use crate::bridge::protocol::{CreditResponse, OnState, PaxError};
 use crate::bridge::transport;
 use crate::bridge::AppState;
@@ -27,7 +28,7 @@ fn error_map(code: &str) -> (StatusCode, &'static str) {
         ),
         "CONNECTION_REFUSED" => (
             StatusCode::BAD_GATEWAY,
-            "Device reachable but BroadPOS is not listening on this port. In BroadPOS TSYS Sierra: set ECR-Terminal Integration Mode = External POS, Communication = TCP, Host Port = 10009 (or USB if using a cable), then leave BroadPOS on the idle screen.",
+            "Device reachable but POS/ECR listener is closed on this port. Run Diagnose on the terminal for vendor-specific setup steps.",
         ),
         "HOST_UNREACHABLE" => (
             StatusCode::BAD_GATEWAY,
@@ -67,6 +68,30 @@ fn error_map(code: &str) -> (StatusCode, &'static str) {
         "SERIAL_UNAVAILABLE" => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Serial support (the \"serialport\" native module) is not installed. Run npm install in the server directory.",
+        ),
+        "CLOVER_PAIRING_REQUIRED" => (
+            StatusCode::PRECONDITION_REQUIRED,
+            "Clover Flex needs one-time pairing. Click Pair and enter the 4-digit code shown on screen into the Clover Flex.",
+        ),
+        "CLOVER_PAIRING_FAILED" => (
+            StatusCode::BAD_GATEWAY,
+            "Clover pairing was rejected or timed out. Make sure Secure Network Pay Display is open on the Flex and click Pair again.",
+        ),
+        "CLOVER_AUTH_MISSING" => (
+            StatusCode::BAD_REQUEST,
+            "Enter your Clover OAuth Bearer Token and Device Serial ID in terminal settings.",
+        ),
+        "VALOR_CONFIG_MISSING" => (
+            StatusCode::BAD_REQUEST,
+            "Enter the Valor EPI, App ID, and App Key from the Valor Portal in terminal settings.",
+        ),
+        "DEJAVOO_CONFIG_MISSING" => (
+            StatusCode::BAD_REQUEST,
+            "Enter the Dejavoo TPN and Auth Key from the STEAM / iPOSpays portal in terminal settings.",
+        ),
+        "UNSUPPORTED" => (
+            StatusCode::BAD_REQUEST,
+            "This operation is not supported by the selected terminal connection mode.",
         ),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "Unexpected server error."),
     }
@@ -112,6 +137,7 @@ fn non_empty(s: &str) -> &str {
     }
 }
 
+#[allow(dead_code)]
 fn json_number(v: Option<&Value>) -> Option<f64> {
     match v {
         Some(Value::Number(n)) => n.as_f64(),
@@ -121,71 +147,10 @@ fn json_number(v: Option<&Value>) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Terminal validation (mirrors `validateTerminal` in index.js)
+// Terminal validation (multi-vendor)
 // ---------------------------------------------------------------------------
-const MODELS: [&str; 2] = ["A920 Pro", "A35"];
-
 fn validate_terminal(body: &Value, partial: bool) -> Vec<String> {
-    let mut errors = Vec::new();
-
-    let name_present = body.get("name").is_some();
-    if !partial || name_present {
-        let empty = body.get("name").and_then(Value::as_str).map(|s| s.trim().is_empty()).unwrap_or(true);
-        if empty {
-            errors.push("name is required".to_string());
-        }
-    }
-
-    let conn_type_field = body.get("connType").and_then(Value::as_str);
-    if let Some(ct) = conn_type_field {
-        if ct != "tcp" && ct != "usb" {
-            errors.push("connType must be 'tcp' or 'usb'".to_string());
-        }
-    }
-
-    let effective_type: Option<&str> = if let Some(ct) = conn_type_field {
-        Some(ct)
-    } else if !partial {
-        Some("tcp")
-    } else {
-        None
-    };
-
-    if effective_type == Some("usb") {
-        if !partial || body.get("serialPath").is_some() || conn_type_field.is_some() {
-            let empty = body.get("serialPath").and_then(Value::as_str).map(|s| s.trim().is_empty()).unwrap_or(true);
-            if empty {
-                errors.push("serialPath is required for USB terminals".to_string());
-            }
-        }
-        if let Some(v) = body.get("baudRate") {
-            let n = json_number(Some(v));
-            if n.map(|x| x <= 0.0).unwrap_or(true) {
-                errors.push("baudRate must be a positive number".to_string());
-            }
-        }
-    } else if effective_type == Some("tcp") {
-        if !partial || body.get("ip").is_some() || conn_type_field.is_some() {
-            let empty = body.get("ip").and_then(Value::as_str).map(|s| s.trim().is_empty()).unwrap_or(true);
-            if empty {
-                errors.push("ip is required for LAN (TCP) terminals".to_string());
-            }
-        }
-        if let Some(v) = body.get("port") {
-            let n = json_number(Some(v));
-            if n.map(|x| x <= 0.0).unwrap_or(true) {
-                errors.push("port must be a positive number".to_string());
-            }
-        }
-    }
-
-    if let Some(m) = body.get("model").and_then(Value::as_str) {
-        if !MODELS.contains(&m) {
-            errors.push(format!("model must be one of: {}", MODELS.join(", ")));
-        }
-    }
-
-    errors
+    drivers::validate_terminal(body, partial)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,8 +961,47 @@ async fn cancel_payment(State(state): State<AppState>, Path(id): Path<String>) -
 // Misc routes
 // ---------------------------------------------------------------------------
 
+async fn pair_terminal(State(state): State<AppState>, Path(id): Path<String>) -> (StatusCode, Json<Value>) {
+    let terminal = { state.db.lock().await.get_terminal(&id) };
+    let terminal = match terminal {
+        Some(t) => t,
+        None => return not_found("Terminal not found"),
+    };
+
+    let ws_for_code = state.ws.clone();
+    let tid_for_code = id.clone();
+    let on_code: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |code| {
+        ws_for_code.emit(json!({
+            "type": "PAIRING_CODE",
+            "terminalId": tid_for_code,
+            "pairingCode": code,
+        }));
+    });
+
+    match transport::pair(&terminal, on_code).await {
+        Ok((auth_token, discovery)) => {
+            let updated = if !auth_token.is_empty() {
+                state
+                    .db
+                    .lock()
+                    .await
+                    .set_vendor_config_key(&id, "authToken", Value::String(auth_token))
+            } else {
+                Some(terminal)
+            };
+            state.ws.emit(json!({ "type": "PAIRED", "terminalId": id }));
+            (StatusCode::OK, Json(json!({ "paired": true, "terminal": updated, "discovery": discovery })))
+        }
+        Err(err) => pax_error_response(&err),
+    }
+}
+
+async fn list_drivers() -> Json<Value> {
+    Json(drivers::driver_catalog())
+}
+
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok", "message": "Server is running", "bridgeVersion": "rust-tauri" }))
+    Json(json!({ "status": "ok", "message": "Server is running", "bridgeVersion": "rust-tauri-multi" }))
 }
 
 async fn api_root() -> Json<Value> {
@@ -1014,6 +1018,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(list_terminals).post(create_terminal))
         .route("/{id}", put(update_terminal_handler).delete(delete_terminal_handler))
         .route("/{id}/ping", post(ping_terminal))
+        .route("/{id}/pair", post(pair_terminal))
         .route("/{id}/cancel", post(cancel_terminal))
         .route("/{id}/diagnose", post(diagnose_terminal))
         .route("/{id}/batch-close", post(batch_close_terminal));
@@ -1027,6 +1032,7 @@ pub fn router(state: AppState) -> Router {
         .route("/{id}/cancel", post(cancel_payment));
 
     Router::new()
+        .route("/api/drivers", get(list_drivers))
         .route("/api/health", get(health))
         .route("/api", get(api_root))
         .nest("/api/terminals", terminals_router)
