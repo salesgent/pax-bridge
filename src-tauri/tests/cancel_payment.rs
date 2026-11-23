@@ -43,6 +43,7 @@ async fn approving_terminal(delay: Duration) -> u16 {
 }
 
 /// A T01 frame the real parser accepts: approved, $110.00, ref number 42.
+/// Trace subfields per BroadPOS T01 spec: [transactionNum, ecrRefNum, timestamp].
 fn approved_t01() -> Vec<u8> {
     protocol::build_message(&[
         Field::Single("T01".into()),
@@ -53,7 +54,7 @@ fn approved_t01() -> Vec<u8> {
         Field::Single(String::new()),
         Field::Sub(vec!["11000".into(), "0".into()]),
         Field::Sub(vec!["************1234".into(), String::new(), "VISA".into(), "CHIP".into()]),
-        Field::Sub(vec!["1".into(), "7".into(), "42".into(), "20260816120000".into()]),
+        Field::Sub(vec!["42".into(), "1".into(), "20260816120000".into()]),
     ])
 }
 
